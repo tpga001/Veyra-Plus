@@ -764,3 +764,31 @@ quantization-aware neutral-tint guard, source-color gamut-ray lightness bound,
 independent lightness/shadow controls, style-specific automatic coefficients
 and an automatic amount slider. These additions are Veyra code; the upstream
 port and public-domain matrix attribution above remain unchanged.
+
+
+## Browser video metadata extension (2026-10-11)
+
+`browser-extension/` is GPL-3.0-or-later. Main-video detection, object-fit
+geometry, UI exclusion rectangles and frontend state handling adapt the local
+[SAOG0721/Magpie](https://github.com/SAOG0721/Magpie) tree at fixed commit
+`931be4541e339612f39c80bca224dd4687872fcd`. Original-file SHA-256 values and
+the stable extension ID are recorded in `browser-extension/SOURCE_PROVENANCE.json`;
+the full license accompanies the extension in `browser-extension/COPYING`.
+
+Veyra changes replace nativeMessaging/application launch with a metadata-only
+loopback HTTP protocol, an explicit bidirectional enable state, independent
+foreground HWND/PID verification, page-zoom/DPR/visual-viewport reporting,
+small-animation filtering and a single-slot report queue. GPU capture and
+enhancement use the existing Veyra engine; no Magpie executable, frame filter,
+model or proprietary runtime is introduced by this extension.
+
+
+## GPUPixel basic beauty (D3D12 algorithm port, 2026-10-14)
+
+Source: https://github.com/pixpark/gpupixel ; local checkout HEAD fd596da4d50bc8035c32f0b400af70536dc59e4f with recorded local edits. Copyright (c) 2021 PixPark. Apache License 2.0.
+
+Veyra ports the basic blur, variance, beauty and whitening LUT equations to D3D12 compute HLSL. It uses explicit SDR transfer, preserved input alpha, FP16 input/output, modeled RGBA8 intermediate rounding, disabled/HDR/image bypass and GPU timing. This is an algorithm port, not execution of the upstream OpenGL DLL. No Mars/VNN SDK, face detector or face models are included.
+
+Full license, notice, upstream file and LUT hashes: source third_party_notices/gpupixel-beauty/; installed package licenses/gpupixel-beauty/. The four tracked PNG LUTs are covered by the upstream root Apache-2.0 declaration; no separate asset exception was found. This does not assert a complete historical rights audit.
+
+2026-10-14 low-strength control update: Veyra now blends the entire four-LUT whitening result from the encoded SDR input, rather than varying only the final light LUT. Zero bypasses whitening; the full-strength endpoint is retained. This is an intentional Veyra control adaptation; the LUT bytes and upstream license are unchanged.

@@ -104,9 +104,11 @@ bool DlssSrBackend::create(NgxCoreHost& coreHost,
     // Video has no renderer exposure texture; use the documented GPU estimator.
     createParams.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR |
         NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+    if(desc.motionVectorsLowRes)createParams.InFeatureCreateFlags|=NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
     createParams.InEnableOutputSubrects = desc.enableOutputSubrects ? 1 : 0;
 
-    log::info("ngx",std::format("sr-backend: linearInput=true flags=0x{:X} exposure=auto mvUnits=output-pixels jitter=source-sampling",createParams.InFeatureCreateFlags));
+    log::info("ngx",std::format("sr-backend: linearInput=true flags=0x{:X} exposure=auto mvLowRes={} mvUnits={} jitter=source-sampling",
+        createParams.InFeatureCreateFlags,desc.motionVectorsLowRes,desc.motionVectorsLowRes?"render-pixels":"output-pixels"));
     uint32_t sehCode = 0;
     const NVSDK_NGX_Result result = CallCreateDlss(cmdList, 1, 1, &handle_,
         params, &createParams, sehCode);

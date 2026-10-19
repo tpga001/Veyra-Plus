@@ -296,6 +296,8 @@ veyra_add_compute_shader(veyra_shader_nr_residual NrResidualComposite)
 veyra_add_compute_shader(veyra_shader_nr_temporal NrTemporal)
 # Stage-5 output stabiliser (anti-flicker, default off).
 veyra_add_compute_shader(veyra_shader_nr_hold NrHold)
+veyra_add_compute_shader(veyra_shader_beauty_blur BeautyBlur)
+veyra_add_compute_shader(veyra_shader_beauty_apply BeautyApply)
 veyra_add_compute_shader(veyra_shader_flow_adapt FlowAdapt)
 veyra_add_compute_shader(veyra_shader_rgb_nv12 RgbToNv12)
 
@@ -362,6 +364,7 @@ add_library(veyra_pipeline STATIC
   src/pipeline/ColorGradeTables.cpp
   src/pipeline/ColorGradeInstance.cpp
   src/pipeline/ColorDetailPass.cpp
+  src/pipeline/BeautyPass.cpp
   src/pipeline/NrInstance.cpp
   src/pipeline/LmxxfNrBackend.cpp
   src/pipeline/VfgBackend.cpp
@@ -379,7 +382,7 @@ if(EXISTS "${VEYRA_CUDA_DRIVER_INCLUDE_DIR}/cuda.h")
   target_include_directories(veyra_pipeline PRIVATE "${VEYRA_CUDA_DRIVER_INCLUDE_DIR}")
   target_compile_definitions(veyra_pipeline PRIVATE VEYRA_HAVE_CUDA_DRIVER_HEADERS=1)
 endif()
-target_link_libraries(veyra_pipeline PUBLIC veyra_base veyra_gfx d3d12 dxgi dxguid d3dcompiler)
+target_link_libraries(veyra_pipeline PUBLIC veyra_base veyra_gfx d3d12 dxgi dxguid d3dcompiler windowscodecs shlwapi ole32)
 add_library(veyra_lmxxf_fake_runtime SHARED tests/unit/LmxxfNrFakeRuntime.cpp)
 target_compile_features(veyra_lmxxf_fake_runtime PRIVATE cxx_std_20)
 target_compile_definitions(veyra_lmxxf_fake_runtime PRIVATE LMXXF_NR_RUNTIME_EXPORTS NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -389,7 +392,7 @@ add_executable(veyra_lmxxf_nr_tests tests/unit/LmxxfNrTests.cpp)
 target_compile_features(veyra_lmxxf_nr_tests PRIVATE cxx_std_20)
 target_link_libraries(veyra_lmxxf_nr_tests PRIVATE veyra_pipeline)
 add_dependencies(veyra_lmxxf_nr_tests veyra_lmxxf_fake_runtime)
-add_dependencies(veyra_pipeline veyra_shader_color_grade veyra_shader_color_detail_reduce veyra_shader_color_detail_blur veyra_shader_color_detail_apply)
+add_dependencies(veyra_pipeline veyra_shader_beauty_blur veyra_shader_beauty_apply veyra_shader_color_grade veyra_shader_color_detail_reduce veyra_shader_color_detail_blur veyra_shader_color_detail_apply)
 
 add_executable(veyra_pipeline_tests
   tests/unit/PipelineContractTests.cpp
@@ -645,6 +648,14 @@ if(VEYRA_FFMPEG_ROOT AND EXISTS "${VEYRA_FFMPEG_ROOT}/include/libavformat/avform
   target_include_directories(veyra_live_timing_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
   add_executable(veyra_repair_contract_tests tests/unit/RepairContractTests.cpp)
+  add_executable(veyra_external_subtitle_discovery_tests tests/integration/ExternalSubtitleDiscoveryTests.cpp)
+  target_compile_features(veyra_external_subtitle_discovery_tests PRIVATE cxx_std_20)
+  target_compile_options(veyra_external_subtitle_discovery_tests PRIVATE /utf-8)
+  target_link_libraries(veyra_external_subtitle_discovery_tests PRIVATE veyra_engine)
+  add_executable(veyra_subtitle_alignment_offset_tests tests/integration/SubtitleAlignmentOffsetTests.cpp)
+  target_compile_features(veyra_subtitle_alignment_offset_tests PRIVATE cxx_std_20)
+  target_compile_options(veyra_subtitle_alignment_offset_tests PRIVATE /utf-8)
+  target_link_libraries(veyra_subtitle_alignment_offset_tests PRIVATE veyra_engine)
   add_executable(veyra_subtitle_loading_tests tests/integration/SubtitleLoadingTests.cpp)
   add_executable(veyra_subtitle_text_tests tests/integration/SubtitleTextTests.cpp)
   target_compile_features(veyra_subtitle_text_tests PRIVATE cxx_std_20)
@@ -871,17 +882,52 @@ if(VEYRA_FFMPEG_ROOT AND EXISTS "${VEYRA_FFMPEG_ROOT}/include/libavformat/avform
 option(VEYRA_BUILD_QT_PROBE "Build the Qt + D3D12 host probe" OFF)
 option(VEYRA_BUILD_QML_UI "Build the QML front end" OFF)
 if(VEYRA_BUILD_QT_PROBE OR VEYRA_BUILD_QML_UI)
-  find_package(Qt6 6.8 QUIET COMPONENTS Core Gui Qml Quick QuickControls2 Widgets)
+  find_package(Qt6 6.8 QUIET COMPONENTS Core Gui Qml Quick QuickControls2 Widgets Network)
 endif()
 
 # The QML bridge. It is engine code (no QML files), so it compiles into a
 # separate small library rather than into veyra_engine: the product build must
 # never depend on Qt being installed.
 if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
+  add_library(veyra_display_metrics STATIC src/diagnostics/DisplayFrameMetrics.cpp)
+  target_compile_features(veyra_display_metrics PUBLIC cxx_std_20)
+  target_include_directories(veyra_display_metrics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_options(veyra_display_metrics PRIVATE /utf-8)
+  add_executable(veyra_engine_shutdown_tests tests/unit/EngineShutdownTests.cpp)
+  target_compile_features(veyra_engine_shutdown_tests PRIVATE cxx_std_20)
+  target_compile_options(veyra_engine_shutdown_tests PRIVATE /utf-8)
+  target_compile_definitions(veyra_engine_shutdown_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_link_libraries(veyra_engine_shutdown_tests PRIVATE veyra_engine)
+  add_executable(veyra_display_frame_metrics_tests tests/unit/DisplayFrameMetricsTests.cpp)
+  target_link_libraries(veyra_display_frame_metrics_tests PRIVATE veyra_display_metrics)
+  target_compile_options(veyra_display_frame_metrics_tests PRIVATE /utf-8)
+  add_executable(veyra_display_collector WIN32 apps/veyra-display-collector/main.cpp)
+  target_compile_features(veyra_display_collector PRIVATE cxx_std_20)
+  target_compile_options(veyra_display_collector PRIVATE /utf-8)
+  target_compile_definitions(veyra_display_collector PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+  target_link_libraries(veyra_display_collector PRIVATE Qt6::Core Qt6::Network advapi32 shell32)
+  # Online subtitle retrieval is independent of the renderer. Only this service
+  # receives credentials; both real and loopback-mock tests use the same code.
+  add_library(veyra_online_subtitles STATIC src/ui/OnlineSubtitleService.cpp include/veyra/ui/OnlineSubtitleService.h)
+  set_target_properties(veyra_online_subtitles PROPERTIES AUTOMOC ON)
+  target_compile_features(veyra_online_subtitles PUBLIC cxx_std_20)
+  target_compile_options(veyra_online_subtitles PRIVATE /utf-8)
+  target_compile_definitions(veyra_online_subtitles PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_include_directories(veyra_online_subtitles PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(veyra_online_subtitles PUBLIC veyra_engine Qt6::Core Qt6::Network PRIVATE crypt32)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/OnlineSubtitleServiceTests.cpp")
+    add_executable(veyra_online_subtitle_tests tests/unit/OnlineSubtitleServiceTests.cpp)
+    target_compile_features(veyra_online_subtitle_tests PRIVATE cxx_std_20)
+    target_compile_options(veyra_online_subtitle_tests PRIVATE /utf-8)
+    target_link_libraries(veyra_online_subtitle_tests PRIVATE veyra_online_subtitles)
+  endif()
   add_library(veyra_qml_bridge STATIC src/ui/QmlExportQueueModel.cpp include/veyra/ui/QmlExportQueueModel.h src/ui/QmlPlayerBridge.cpp src/ui/ThumbnailProvider.cpp
     include/veyra/ui/QmlPlayerBridge.h include/veyra/ui/ThumbnailProvider.h
+    src/ui/DisplayMonitor.cpp include/veyra/ui/DisplayMonitor.h
     # P4-c: the existing subtitle renderer, reused as-is (no second renderer).
-    apps/veyra/ui/SubtitleOverlay.cpp)
+    apps/veyra/ui/SubtitleOverlay.cpp
+    src/capture/BrowserCaptureController.cpp include/veyra/capture/BrowserCaptureController.h
+    src/capture/VideoRegionOverlay.cpp include/veyra/capture/VideoRegionOverlay.h)
   set_source_files_properties(apps/veyra/ui/SubtitleOverlay.cpp PROPERTIES COMPILE_OPTIONS /utf-8)
   # AUTOMOC: QmlPlayerBridge declares Q_OBJECT, so its meta-object has to be
   # generated. Without this the library links but every signal is unresolved.
@@ -893,7 +939,15 @@ if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
   target_compile_options(veyra_ui_i18n PRIVATE /utf-8)
   target_include_directories(veyra_ui_i18n PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(veyra_ui_i18n PUBLIC veyra_base Qt6::Core)
-  target_link_libraries(veyra_qml_bridge PUBLIC veyra_ui_i18n)
+  target_link_libraries(veyra_qml_bridge PUBLIC veyra_ui_i18n veyra_online_subtitles)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/OnlineSubtitleBridgeTests.cpp")
+    add_executable(veyra_online_subtitle_bridge_tests tests/unit/OnlineSubtitleBridgeTests.cpp)
+    target_compile_features(veyra_online_subtitle_bridge_tests PRIVATE cxx_std_20)
+    target_compile_options(veyra_online_subtitle_bridge_tests PRIVATE /utf-8)
+    target_compile_definitions(veyra_online_subtitle_bridge_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+    target_link_libraries(veyra_online_subtitle_bridge_tests PRIVATE veyra_qml_bridge)
+    target_link_options(veyra_online_subtitle_bridge_tests PRIVATE "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/apps/veyra/veyra.manifest")
+  endif()
   add_executable(veyra_ui_i18n_tests tests/unit/UiLanguageTests.cpp)
   target_compile_options(veyra_ui_i18n_tests PRIVATE /utf-8)
   target_link_libraries(veyra_ui_i18n_tests PRIVATE veyra_ui_i18n)
@@ -931,7 +985,8 @@ if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
   # Widgets is needed only for QFileDialog: the native file picker is the one
   # piece of the old shell worth keeping, and its own dialog is what users
   # expect from a desktop app. No QWidget UI is created.
-  target_link_libraries(veyra_qml_bridge PUBLIC veyra_engine Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::Widgets)
+  target_link_libraries(veyra_qml_bridge PUBLIC veyra_engine Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::Widgets Qt6::Network)
+  target_link_libraries(veyra_qml_bridge PRIVATE user32 dwmapi gdi32 shell32 ole32 veyra_display_metrics)
   # VEYRA_DISPLAY_VERSION is the human-readable version the app reports; it is
   # the same value the resource file uses, so the UI cannot drift from it.
   target_compile_definitions(veyra_qml_bridge PRIVATE VEYRA_DISPLAY_VERSION="${VEYRA_DISPLAY_VERSION}")
@@ -960,7 +1015,29 @@ if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
   # WIN32: a GUI subsystem binary. Without it a console window follows the app
   # around, which is not what a player should look like. Diagnostics still reach
   # the log file through the logger.
-  add_executable(veyra_qml_ui WIN32 apps/veyra-qml/main.cpp src/ui/QmlDataDirectory.cpp)
+  add_library(veyra_desktop STATIC src/ui/DesktopIntegration.cpp include/veyra/ui/DesktopIntegration.h
+    src/ui/LocalPlayerProfile.cpp include/veyra/ui/LocalPlayerProfile.h
+    src/ui/VideoOutputPublisher.cpp include/veyra/ui/VideoOutputPublisher.h
+    src/ui/UiResponsivenessMonitor.cpp include/veyra/ui/UiResponsivenessMonitor.h)
+  set_target_properties(veyra_desktop PROPERTIES AUTOMOC ON)
+  target_compile_features(veyra_desktop PUBLIC cxx_std_20)
+  target_compile_options(veyra_desktop PRIVATE /utf-8)
+  target_compile_definitions(veyra_desktop PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_include_directories(veyra_desktop PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(veyra_desktop PUBLIC Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network PRIVATE advapi32 shell32 user32)
+  add_executable(veyra_ui_responsiveness_tests tests/unit/UiResponsivenessMonitorTests.cpp)
+  target_link_libraries(veyra_ui_responsiveness_tests PRIVATE veyra_desktop)
+  target_compile_options(veyra_ui_responsiveness_tests PRIVATE /utf-8)
+  add_executable(veyra_video_output_publisher_tests tests/unit/VideoOutputPublisherTests.cpp)
+  target_link_libraries(veyra_video_output_publisher_tests PRIVATE veyra_desktop)
+  target_compile_options(veyra_video_output_publisher_tests PRIVATE /utf-8)
+  add_executable(veyra_local_player_profile_tests tests/unit/LocalPlayerProfileTests.cpp)
+  target_link_libraries(veyra_local_player_profile_tests PRIVATE veyra_desktop)
+  target_compile_options(veyra_local_player_profile_tests PRIVATE /utf-8)
+  add_executable(veyra_desktop_tests tests/unit/DesktopIntegrationTests.cpp)
+  target_link_libraries(veyra_desktop_tests PRIVATE veyra_desktop)
+
+  add_executable(veyra_qml_ui WIN32 apps/veyra-qml/main.cpp apps/veyra-qml/BrowserPreviewHost.cpp src/ui/QmlDataDirectory.cpp)
   # The QML copy is its own always-run step rather than a POST_BUILD of the link:
   # its two long E:/项目 paths on the link statement pushed that command past
   # CMake's response-file threshold, and link.exe reads response files in the
@@ -974,7 +1051,7 @@ if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
   qt_add_resources(veyra_qml_ui "veyra_i18n" PREFIX "/i18n" BASE "${CMAKE_CURRENT_SOURCE_DIR}/i18n" FILES i18n/catalog.json)
   target_compile_features(veyra_qml_ui PRIVATE cxx_std_20)
   # Qt6::CorePrivate only for QUnifiedTimer's slow mode behind --slow-animations.
-  target_link_libraries(veyra_qml_ui PRIVATE veyra_qml_bridge veyra_engine Qt6::CorePrivate dbghelp ole32)
+  target_link_libraries(veyra_qml_ui PRIVATE veyra_qml_bridge veyra_desktop veyra_engine Qt6::CorePrivate dbghelp ole32)
 
   add_executable(veyra_qml_data_tests tests/unit/QmlDataDirectoryTests.cpp src/ui/QmlDataDirectory.cpp)
   target_compile_features(veyra_qml_data_tests PRIVATE cxx_std_20)
@@ -1134,6 +1211,26 @@ add_executable(veyra_sr_reconstruction_tests tests/integration/SrReconstructionT
 
   # Headless quality-core runner (Playbook R3.3): the phase5 gate's quality
   add_library(veyra_engine STATIC src/engine/EngineController.cpp src/engine/PreviewGpuSession.cpp src/engine/EngineControllerImage.cpp src/engine/PosterFrame.cpp src/engine/EffectChain.cpp src/engine/PresetLibrary.cpp src/ui/PlayerUiFacade.cpp src/engine/TiledImageProcessor.cpp src/engine/PresetStore.cpp src/engine/VideoPresenter.cpp src/engine/VideoExportJob.cpp src/engine/ExportStreams.cpp src/engine/ExportQueue.cpp src/engine/ExportJobManager.cpp src/engine/Subtitles.cpp src/engine/FgCompatibilityProbe.cpp)
+  target_sources(veyra_engine PRIVATE src/engine/NativePlaybackPresets.cpp)
+  target_sources(veyra_engine PRIVATE src/engine/BrowserGpuPreview.cpp)
+
+
+  option(VEYRA_BUILD_POTPLAYER_OVERLAY "Build the independent PotPlayer video-region attachment candidate" OFF)
+  if(VEYRA_BUILD_POTPLAYER_OVERLAY)
+    add_library(veyra_capture_attachment STATIC
+      src/capture/PotPlayerVideoProbe.cpp
+      src/capture/VideoRegionOverlay.cpp
+      src/capture/PotPlayerCaptureController.cpp)
+    target_compile_features(veyra_capture_attachment PUBLIC cxx_std_20)
+    target_compile_options(veyra_capture_attachment PRIVATE /utf-8)
+    target_link_libraries(veyra_capture_attachment PUBLIC veyra_engine user32 dwmapi)
+    add_executable(veyra_potplayer_overlay WIN32 apps/veyra-overlay/main.cpp)
+    target_compile_features(veyra_potplayer_overlay PRIVATE cxx_std_20)
+    target_compile_options(veyra_potplayer_overlay PRIVATE /utf-8)
+    target_compile_definitions(veyra_potplayer_overlay PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(veyra_potplayer_overlay PRIVATE veyra_capture_attachment shell32 ole32)
+    target_link_options(veyra_potplayer_overlay PRIVATE "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/apps/veyra/veyra.manifest")
+  endif()
   target_sources(veyra_pipeline PRIVATE src/guidance/AmdOpticalFlow.cpp
     src/guidance/GpuDisOpticalFlow.cpp third_party/gpu-dis/src/gpu/native_strict_dis_provider.cpp)
   target_include_directories(veyra_pipeline PRIVATE third_party/gpu-dis/src/gpu)
@@ -1156,6 +1253,42 @@ add_executable(veyra_sr_reconstruction_tests tests/integration/SrReconstructionT
   target_compile_features(veyra_vfg_export_probe PRIVATE cxx_std_20)
   target_compile_options(veyra_vfg_export_probe PRIVATE /utf-8)
   target_link_libraries(veyra_vfg_export_probe PRIVATE veyra_engine)
+  add_executable(veyra_browser_attachment_policy_tests tests/unit/BrowserAttachmentPolicyTests.cpp)
+  target_compile_features(veyra_browser_attachment_policy_tests PRIVATE cxx_std_20)
+  target_compile_options(veyra_browser_attachment_policy_tests PRIVATE /utf-8)
+  target_include_directories(veyra_browser_attachment_policy_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_executable(veyra_browser_preview_policy_tests tests/unit/BrowserPreviewPolicyTests.cpp)
+  target_compile_features(veyra_browser_preview_policy_tests PRIVATE cxx_std_20)
+  target_compile_options(veyra_browser_preview_policy_tests PRIVATE /utf-8)
+  target_include_directories(veyra_browser_preview_policy_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_definitions(veyra_browser_preview_policy_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+
+  add_executable(veyra_browser_preview_gpu_tests tests/integration/BrowserPreviewGpuTests.cpp)
+  target_compile_features(veyra_browser_preview_gpu_tests PRIVATE cxx_std_20)
+  target_compile_options(veyra_browser_preview_gpu_tests PRIVATE /utf-8)
+  target_include_directories(veyra_browser_preview_gpu_tests PRIVATE ${FFMPEG_INCLUDE_DIRS})
+  target_compile_definitions(veyra_browser_preview_gpu_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_link_libraries(veyra_browser_preview_gpu_tests PRIVATE veyra_engine)
+
+  add_executable(veyra_browser_preview_comparison_gpu_tests tests/integration/BrowserPreviewComparisonGpuTests.cpp)
+  target_compile_features(veyra_browser_preview_comparison_gpu_tests PRIVATE cxx_std_20)
+  target_compile_options(veyra_browser_preview_comparison_gpu_tests PRIVATE /utf-8)
+  target_include_directories(veyra_browser_preview_comparison_gpu_tests PRIVATE ${FFMPEG_INCLUDE_DIRS})
+  target_compile_definitions(veyra_browser_preview_comparison_gpu_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_link_libraries(veyra_browser_preview_comparison_gpu_tests PRIVATE veyra_engine)
+
+  add_executable(veyra_browser_telemetry_tests tests/unit/BrowserTelemetryTests.cpp)
+  target_compile_features(veyra_browser_telemetry_tests PRIVATE cxx_std_20)
+  target_compile_options(veyra_browser_telemetry_tests PRIVATE /utf-8)
+  target_compile_definitions(veyra_browser_telemetry_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_include_directories(veyra_browser_telemetry_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_options(veyra_browser_telemetry_tests PRIVATE /STACK:33554432)
+  add_executable(veyra_native_playback_presets_tests tests/unit/NativePlaybackPresetsTests.cpp
+    src/engine/NativePlaybackPresets.cpp src/engine/PresetLibrary.cpp src/engine/PresetStore.cpp src/engine/EffectChain.cpp)
+  target_compile_features(veyra_native_playback_presets_tests PRIVATE cxx_std_20)
+  target_include_directories(veyra_native_playback_presets_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(veyra_native_playback_presets_tests PRIVATE veyra_base)
+  target_link_options(veyra_native_playback_presets_tests PRIVATE /STACK:33554432)
   add_executable(veyra_preset_library_tests tests/unit/PresetLibraryTests.cpp src/engine/PresetLibrary.cpp src/engine/EffectChain.cpp)
 target_link_options(veyra_preset_library_tests PRIVATE /STACK:33554432) # Preset apply recurses over 21 KB ChainConfiguration frames; the default 1 MB stack is too close to the edge.
 add_executable(veyra_hdr_tuning_tests tests/unit/HdrOutputTuningTests.cpp src/engine/PresetLibrary.cpp src/engine/EffectChain.cpp)
@@ -1434,3 +1567,37 @@ if(TARGET veyra_qml_ui)
   configure_file(apps/veyra/veyra.manifest ${CMAKE_CURRENT_BINARY_DIR}/veyra-qml.manifest COPYONLY)
   target_link_options(veyra_qml_ui PRIVATE "/MANIFESTINPUT:veyra-qml.manifest")
 endif()
+
+
+# Stage11 basic beauty: immutable synthetic reference, no user-video readback.
+add_executable(veyra_beauty_settings_tests tests/unit/BeautySettingsTests.cpp)
+target_compile_features(veyra_beauty_settings_tests PRIVATE cxx_std_20)
+target_compile_options(veyra_beauty_settings_tests PRIVATE /utf-8 /WX-)
+target_link_libraries(veyra_beauty_settings_tests PRIVATE veyra_engine)
+add_executable(veyra_beauty_gpu_tests tests/integration/BeautyGpuTests.cpp)
+target_compile_features(veyra_beauty_gpu_tests PRIVATE cxx_std_20)
+target_compile_options(veyra_beauty_gpu_tests PRIVATE /utf-8 /WX-)
+target_link_libraries(veyra_beauty_gpu_tests PRIVATE veyra_pipeline)
+
+add_executable(veyra_beauty_graph_gpu_tests tests/integration/BeautyGraphGpuTests.cpp)
+target_compile_features(veyra_beauty_graph_gpu_tests PRIVATE cxx_std_20)
+target_compile_options(veyra_beauty_graph_gpu_tests PRIVATE /utf-8 /WX-)
+target_include_directories(veyra_beauty_graph_gpu_tests PRIVATE ${FFMPEG_INCLUDE_DIRS})
+target_link_libraries(veyra_beauty_graph_gpu_tests PRIVATE veyra_engine)
+
+# Browser RTX source-sized input: policy checks and a production-graph GPU probe.
+add_executable(veyra_browser_rtx_input_tests tests/unit/BrowserRtxInputTests.cpp)
+target_compile_features(veyra_browser_rtx_input_tests PRIVATE cxx_std_20)
+target_compile_options(veyra_browser_rtx_input_tests PRIVATE /utf-8 /WX-)
+target_link_libraries(veyra_browser_rtx_input_tests PRIVATE veyra_engine)
+add_executable(veyra_browser_rtx_sr_perf tests/perf/BrowserRtxSrPerf.cpp)
+target_compile_features(veyra_browser_rtx_sr_perf PRIVATE cxx_std_20)
+target_compile_options(veyra_browser_rtx_sr_perf PRIVATE /utf-8 /WX-)
+target_link_libraries(veyra_browser_rtx_sr_perf PRIVATE veyra_engine)
+
+# Explicit task-scoped same-frame SR proof policy (CPU only).
+add_executable(veyra_sr_proof_policy_tests tests/unit/SrProofPolicyTests.cpp)
+target_compile_features(veyra_sr_proof_policy_tests PRIVATE cxx_std_20)
+target_compile_options(veyra_sr_proof_policy_tests PRIVATE /utf-8 /WX-)
+target_compile_definitions(veyra_sr_proof_policy_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(veyra_sr_proof_policy_tests PRIVATE include)

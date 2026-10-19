@@ -1,6 +1,7 @@
 #pragma once
 #include "veyra/engine/EnhancementSettings.h"
 #include "veyra/engine/ExportFeaturePolicy.h"
+#include "veyra/engine/BrowserRtxInputPolicy.h"
 #include "veyra/pipeline/EnhanceGraph.h"
 #include "veyra/pipeline/ResolutionPlan.h"
 
@@ -53,8 +54,9 @@ struct StageRequest {
 // host hooks are left untouched: the caller owns those.
 inline pipeline::ResolutionPlan describeStages(const StageRequest& request,const EnhancementSettings& savedSettings,
                                                pipeline::EnhanceGraphDesc& desc) {
-    desc.fixedExecutionPlan.reset();desc.fixedExecutionPlanError.clear();
+    desc.fixedExecutionPlan.reset();desc.fixedExecutionPlanError.clear();desc.videoSrInputExtent={};
     desc.runtimeNodeOrder=request.nodeOrder!=nullptr;
+    desc.stillImage=request.stillImage; // authoritative source kind for shared stage policy
     if(savedSettings.nrLayerCount>savedSettings.nrLayers.size()||savedSettings.additionalColorCount>savedSettings.additionalColors.size()){
         desc.fixedExecutionPlanError="too many runtime chain instances";return {};
     }
@@ -81,18 +83,33 @@ inline pipeline::ResolutionPlan describeStages(const StageRequest& request,const
         currentNrRuntime(settings.nrRuntime)==NrRuntime::LmxxfAmd;
     const auto policy=request.exportJob?exportNrSizePolicy(settings.nrRuntime):settings.nrPolicy;
     if(!pipeline::Extent{request.width,request.height}.valid()||!pipeline::validSrTarget(settings.srTarget)||
-       !pipeline::validNrSizePolicy(policy)){
+       !pipeline::validNrSizePolicy(policy)||(settings.srPlaybackExtent!=pipeline::Extent{}&&!settings.srPlaybackExtent.valid())){
         // ResolutionPlan::make throws for these inputs. Report the same
         // invalid contract before any graph allocation, including on reuse.
         desc.fixedExecutionPlanError="invalid fixed-plan source extent, SR target or NR size policy";
         return {};
     }
-    const auto plan=pipeline::ResolutionPlan::make({request.width,request.height},request.sr,policy,
-        (request.stillImage||request.exportJob)&&!boundedAmd,settings.revision,settings.srTarget,lowLatency);
+    const auto playbackLimit=request.stillImage||request.exportJob?pipeline::Extent{}:settings.srPlaybackExtent;
+    auto plan=pipeline::ResolutionPlan::make({request.width,request.height},request.sr,policy,
+        (request.stillImage||request.exportJob)&&!boundedAmd,settings.revision,settings.srTarget,lowLatency,playbackLimit);
     desc.sourceWidth=request.width;desc.sourceHeight=request.height;
     desc.workWidth=plan.base.width;desc.workHeight=plan.base.height;
     desc.nrWidth=plan.nr.width;desc.nrHeight=plan.nr.height;
     desc.flowWidth=plan.flow.width;desc.flowHeight=plan.flow.height;
+    // Browser-only sampling hint: raw ingress, references, NR and final output
+    // retain their plan. DLSS/FSR color/depth/motion and their optical-flow input use
+    // the reduced sampling grid; RTX keeps its existing encoded-input path.
+    // Export/images/HDR/NR-first deliberately retain their full source input.
+    if(request.sr&&(request.nvidiaAdapter||settings.videoSrQuality==kVideoSrFsr)&&!request.stillImage&&!request.exportJob&&
+       !desc.hdrInput&&!desc.hdrOutput&&!lowLatency&&settings.videoSrQuality<=kVideoSrFsr)
+        desc.videoSrInputExtent=validatedVideoSrInputExtent(settings.videoSrInputExtent,plan.source,plan.base);
+    if(desc.videoSrInputExtent!=pipeline::Extent{}) {
+        plan.srApplied=true;
+        if(settings.videoSrQuality==0||settings.videoSrQuality==kVideoSrFsr) {
+            plan.flow=desc.videoSrInputExtent;
+            desc.flowWidth=plan.flow.width;desc.flowHeight=plan.flow.height;
+        }
+    }
     desc.enableSr=plan.srApplied&&(request.nvidiaAdapter||settings.videoSrQuality==kVideoSrFsr);
     desc.enableNr=request.nr&&(request.nvidiaAdapter||request.amdNr)&&(!settings.nrLayerCount||settings.activeNrLayerCount()>0);
     desc.nrBeforeSr=!request.stillImage&&!request.exportJob&&lowLatency&&desc.enableNr&&desc.enableSr;
@@ -111,6 +128,10 @@ inline pipeline::ResolutionPlan describeStages(const StageRequest& request,const
     desc.additionalColors=settings.additionalColors;
     desc.additionalColorCount=settings.additionalColorCount;
     desc.videoHdr=settings.videoHdr;
+    desc.beauty=settings.beauty;
+    // Stage11 beauty is video-only. Preserve the caller's saved request while
+    // excluding this stage from an image graph and its resource plan.
+    if(request.stillImage)desc.beauty.enabled=false;
     // Custom: static HDR output tuning (present blit curve + display metadata).
     desc.hdrCurve=settings.hdrCurve;
     desc.hdrMetadata=settings.hdrMetadata;
@@ -120,7 +141,9 @@ inline pipeline::ResolutionPlan describeStages(const StageRequest& request,const
     desc.flowQuality=settings.flow;
     desc.contentRate=settings.content;
     desc.opticalFlowBackend=settings.opticalFlowBackend;
-    desc.amdFlowHalfResolution=settings.amdFlowHalfResolution;
+    // The browser SR sampling grid is already bounded. Halving it again would
+    // make the SDK motion texture disagree with render-sized color/depth.
+    desc.amdFlowHalfResolution=settings.amdFlowHalfResolution&&!desc.sourceSizedSr();
     desc.nrLayersExtent.clear();
     for(uint32_t i=0;i<chain.nodeCount;++i){
         auto& node=chain.nodes[i];
@@ -132,11 +155,37 @@ inline pipeline::ResolutionPlan describeStages(const StageRequest& request,const
             node.enabled=desc.enableNr&&(!settings.nrLayerCount||node.enabled);
         if(node.type==EffectType::Protection)node.enabled=node.enabled&&desc.enableNr;
         if(node.type==EffectType::FrameGeneration)node.enabled=desc.enableFg;
+        if(node.type==EffectType::Beauty)node.enabled=desc.beauty.enabled;
     }
     ChainExecutionPlan execution;
     const auto validation=compileChainExecutionPlan(chain,{{request.width,request.height},settings.srTarget,
-        request.stillImage,request.exportJob,boundedAmd},execution);
+        request.stillImage,request.exportJob,boundedAmd,playbackLimit},execution);
     if(!validation.accepted){desc.fixedExecutionPlanError=validation.message;return plan;}
+    // The generic chain compiler elides identity source->output resizes. A
+    // full-screen 4K capture with a bounded browser SR input still performs real AI
+    // reconstruction, so retain its SR boundary without changing raw/output
+    // extents or the dimensions of any later stage.
+    if(desc.videoSrInputExtent!=pipeline::Extent{}&&
+       execution.resourceCounts[size_t(EffectType::SuperResolution)]==0){
+        uint32_t node=chain.nodeCount;
+        for(uint32_t i=0;i<chain.nodeCount;++i)
+            if(chain.nodes[i].enabled&&chain.nodes[i].type==EffectType::SuperResolution){node=i;break;}
+        if(node==chain.nodeCount||execution.stepCount>=execution.steps.size()){
+            desc.fixedExecutionPlanError="bounded video SR has no available execution step";return plan;
+        }
+        uint32_t position=0;
+        if(chain.mode==ChainMode::Node){
+            while(position<execution.stepCount&&execution.steps[position].nodeIndex<node)++position;
+        }else{
+            while(position<execution.stepCount&&execution.steps[position].type==EffectType::Color)++position;
+        }
+        std::move_backward(execution.steps.begin()+position,execution.steps.begin()+execution.stepCount,
+            execution.steps.begin()+execution.stepCount+1);
+        ChainExecutionStep step;step.type=EffectType::SuperResolution;step.nodeIndex=node;
+        step.input=plan.source;step.processing=step.output=plan.base;
+        execution.steps[position]=step;++execution.stepCount;
+        execution.resourceCounts[size_t(EffectType::SuperResolution)]=1;
+    }
     if(request.nodeOrder){
         // Node order owns the first NR stage, even for an ordinary resize or
         // same-size SR bypass. Each NR resource keeps its own compiled input.
@@ -154,7 +203,7 @@ inline pipeline::ResolutionPlan describeStages(const StageRequest& request,const
     if(!desc.enableNr)for(const auto size:desc.nrLayersSizePolicy){
         desc.nrLayersExtent.push_back(pipeline::ResolutionPlan::make({request.width,request.height},request.sr,
             request.exportJob?exportNrSizePolicy(settings.nrRuntime):size,(request.stillImage||request.exportJob)&&!boundedAmd,
-            settings.revision,settings.srTarget,lowLatency).nr);
+            settings.revision,settings.srTarget,lowLatency,playbackLimit).nr);
     }
     desc.fixedExecutionPlan=execution;
     return plan;

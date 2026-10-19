@@ -25,3 +25,26 @@ CMakeUserPresets.json
 /loop/STOP
 /loop/tmp/
 /loop/local/
+
+# Fork-local caches, credentials and generated diagnostics
+**/__pycache__/
+*.py[cod]
+*.log
+*.tmp
+*.dll
+*.exe
+*.lib
+*.obj
+*.ax
+*.onnx
+*.pth
+*.pt
+.env
+.env.*
+*.pem
+*.key
+/.tools/
+/user-data/
+/downloads/
+/test-results/
+/artifacts/

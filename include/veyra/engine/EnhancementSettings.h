@@ -9,6 +9,7 @@
 #include "veyra/pipeline/ResolutionPlan.h"
 #include "veyra/source/CaptureBuffer.h"
 #include "veyra/engine/ColorSettings.h"
+#include "veyra/engine/BeautySettings.h"
 namespace veyra::engine {
 inline constexpr uint32_t kMaxColorInstances = 6;
 inline constexpr uint32_t kMaxNrInstances = 4;
@@ -216,6 +217,7 @@ struct EnhancementSettings {
     NrSettings model;
     ResidualSettings residual;
     ProtectionSettings protection;
+    BeautySettings beauty;
     bool nr=false,sr=false;
     bool lowLatency=false; // preview only: NR before SR, opt-in
     NrRuntime nrRuntime=NrRuntime::Original;
@@ -300,6 +302,12 @@ struct EnhancementSettings {
     HdrMetadataSettings hdrMetadata;
     bool useHdrPreview(bool hdrInput,bool hdrDisplayActive)const{return (hdrInput||videoHdr.enabled)&&hdrDisplayActive&&!forceSdrPreview;}
     pipeline::SrTarget srTarget=pipeline::SrTarget::Uhd4K;
+    // Runtime-only playback projection. Never serialized into presets/sessions.
+    pipeline::Extent srPlaybackExtent{};
+    // Runtime-only browser DLSS/RTX/FSR input projection. Empty retains the full
+    // composited capture; never serialize this into presets/sessions/export.
+    // Kept in sameVideoConfiguration's equality: a changed texture size rebuilds.
+    pipeline::Extent videoSrInputExtent{};
     uint32_t videoSrQuality=0; // 0 DLSS SR; 1–4 RTX Video SR
     uint32_t multiplier=1;
     FrameGenerationBackend frameGenerationBackend=FrameGenerationBackend::Dlss;
@@ -354,6 +362,8 @@ struct EnhancementSettings {
             video.additionalColors[i].lutName=additionalColors[i].lutName;
             video.additionalColors[i].lutInputSpace=additionalColors[i].lutInputSpace;
         }
+        video.beauty=other.beauty;
+        video.beauty.enabled=beauty.enabled;
         video.videoHdr=other.videoHdr;
         video.videoHdr.enabled=videoHdr.enabled;
         return video==other;
@@ -369,6 +379,7 @@ struct EnhancementSettings {
     std::string validate() const {
         if(hdrOutputMode<HdrOutputMode::Hdr10||hdrOutputMode>HdrOutputMode::ScRgb)return "invalid HDR output mode";
         for(auto source:{fgMotion,srMotion,nrMotion})if(source<MotionSource::Zero||source>MotionSource::Automatic)return "invalid motion source";
+        if(!beauty.valid())return "invalid beauty parameters";
         if(!videoHdr.valid())return "invalid RTX Video HDR parameters";
         if(!hdrCurve.valid())return "invalid HDR curve parameters";
         if(!hdrMetadata.valid())return "invalid HDR metadata parameters";
@@ -416,6 +427,7 @@ struct EnhancementSettings {
         if(fsrFrameGeneration(frameGenerationBackend)&&multiplier>2)return "AMD FSR frame generation supports up to 2X";
         if(videoSrQuality>kVideoSrFsr)return "invalid video SR quality";
         if(!pipeline::validSrTarget(srTarget))return "invalid SR target";
+        if(srPlaybackExtent!=pipeline::Extent{}&&!srPlaybackExtent.valid())return "invalid playback SR extent";
         if(opticalFlowBackend!=OpticalFlowBackend::Nvidia&&opticalFlowBackend!=OpticalFlowBackend::AmdFidelityFx&&opticalFlowBackend!=OpticalFlowBackend::GpuDis)return "invalid optical flow backend";
         if(multiplier<1||multiplier>(frameGenerationBackend==FrameGenerationBackend::Vfg?8u:6u))return "unsupported multiplier";
         // 0 = auto quality; explicit values are capped at 300 Mbps so a typo

@@ -1,7 +1,7 @@
 // 首页, rebuilt from the design (pages-a.js PAGES.home + pages.css .home).
 //
 // The design is: a large logo, a two-line greeting, a 4-up grid of source cards
-// (164x124 each), a "continue last capture" row, and a row of recent chips.
+// (164x124 each). Playback history is deliberately absent from this page.
 // The logo in the dock returns here; there is no other home affordance.
 import QtQuick
 import QtQuick.Controls
@@ -11,6 +11,7 @@ import QtQuick.Effects
 VPage {
     id: root
     signal requestPage(string page)
+    readonly property bool localPlayer: typeof veyraDesktop !== "undefined" && veyraDesktop.localPlayer
 
     ColumnLayout {
         anchors.centerIn: parent
@@ -85,12 +86,13 @@ VPage {
             }
         }
 
-        // .srcgrid: 164px cards, gap 12. Six cards since PC and Xbox streaming (1044 wide,
-        // fits a 1280 window); a narrower window wraps them onto a second row.
+        // Seven equal source cards. A narrow window wraps the same entries onto a second row.
         Flow {
             id: srcGrid
+            objectName: "home-source-grid"
             Layout.alignment: Qt.AlignHCenter
-            Layout.preferredWidth: Math.min(1044, root.width - 48)
+            readonly property int sourceColumns: Math.max(1, Math.min(7, Math.floor((root.width - 36) / 176)))
+            Layout.preferredWidth: sourceColumns * 176 - 12
             spacing: 12
             // Subtitles name what is really there: the device of the last capture
             // session and the saved PS5 host; generic wording when there is none.
@@ -101,6 +103,7 @@ VPage {
             function cardSub(act) {
                 switch (act) {
                 case "file": return qsTr("MP4 · MKV · 图片")
+                case "browser": return root.localPlayer ? qsTr("在常驻进程中运行") : veyra.browserEnabled ? qsTr("已开启 · ") + (veyra.browserTelemetry.live ? qsTr("播放中") : veyra.browserTelemetry.hasLastSample ? qsTr("已冻结") : qsTr("等待视频")) : qsTr("Chrome · Edge 视频")
                 case "capture": return veyra.hasCaptureSession ? veyra.captureSessionSummary.split(" · ")[0] : qsTr("HDMI 采集设备")
                 case "ps5": return veyra.remotePlayHost.length > 0 ? qsTr("已保存主机 ") + veyra.remotePlayHost : qsTr("局域网串流")
                 case "moonlight": return veyra.moonlight && veyra.moonlight.state.lastLabel ? veyra.moonlight.state.lastLabel : qsTr("Sunshine 主机")
@@ -111,6 +114,7 @@ VPage {
             Repeater {
                 model: [
                     { glyph: "folder", title: qsTr("打开视频"), act: "file" },
+                    { glyph: "globe", title: qsTr("浏览器增强"), act: "browser" },
                     { glyph: "video", title: qsTr("采集卡"), act: "capture" },
                     { glyph: "gamepad", title: qsTr("PS5 串流"), act: "ps5" },
                     { glyph: "cast", title: qsTr("PC 串流"), act: "moonlight" },
@@ -122,6 +126,7 @@ VPage {
                 // overwritten); the entrance rise goes on the slot.
                 delegate: Item {
                     id: slot
+                    objectName: "home-source-" + modelData.act
                     required property var modelData
                     required property int index
                     implicitWidth: 164
@@ -179,10 +184,15 @@ VPage {
                     HoverHandler { id: cardHover; cursorShape: Qt.PointingHandCursor }
                     TapHandler {
                         id: cardTap
+                        objectName: "home-source-action-" + modelData.act
                         onTapped: {
                             veyra.logUi("ui-source", "home card act=" + modelData.act)
                             switch (modelData.act) {
                             case "file": veyra.openFileDialog(); break
+                            case "browser":
+                                if (root.localPlayer) veyraDesktop.showResidentWindow()
+                                else veyra.openBrowserDialog()
+                                break
                             case "capture": veyra.openCaptureDialog(); break
                             case "ps5": veyra.openPs5Dialog(); break
                             case "moonlight": veyra.openMoonlightDialog(); break
@@ -196,129 +206,9 @@ VPage {
             }
         }
 
-        // .resume: 692 wide, an accent-tinted gradient plate, shown only when a
-        // capture session was actually used before. Nothing invented: the text is
-        // the recorded session, and the row is absent when there is none.
-        Rectangle {
-            id: resume
-            objectName: "home-resume"
-            Layout.alignment: Qt.AlignHCenter
-            // The last source actually used: capture card, PS5 or screen capture.
-            readonly property var last: veyra.lastSource
-            visible: last.kind !== undefined
-            implicitWidth: srcGrid.width
-            implicitHeight: 54
-            radius: 14
-            border.width: 1
-            border.color: Theme.stroke
-            gradient: Gradient {
-                orientation: Gradient.Horizontal
-                GradientStop { position: 0.0; color: Theme.accentSoft }
-                GradientStop { position: 1.0; color: Qt.rgba(1, 1, 1, 0.03) }
-            }
-            RowLayout {
-                anchors.fill: parent
-                anchors.leftMargin: 14
-                anchors.rightMargin: 10
-                spacing: 14
-                Rectangle {
-                    implicitWidth: 34; implicitHeight: 34; radius: 10
-                    color: Theme.accentSoft
-                    VIcon {
-                        anchors.centerIn: parent
-                        name: resume.last.kind === "screen" ? "monitor" : resume.last.kind === "capture" ? "video" : "gamepad"
-                        color: Theme.accent
-                    }
-                }
-                ColumnLayout {
-                    Layout.fillWidth: true
-                    spacing: 2
-                    Text {
-                        text: qsTr("继续上次")
-                        color: Theme.t1
-                        font.family: Theme.fontUi
-                        font.pixelSize: Theme.fsBody
-                        font.weight: Font.DemiBold; font.variableAxes: Theme.axesDemiBold
-                    }
-                    Text {
-                        Layout.fillWidth: true
-                        text: resume.last.summary || ""
-                        color: Theme.t2
-                        font.family: Theme.fontUi
-                        font.pixelSize: 12
-                        elide: Text.ElideRight
-                    }
-                }
-                VButton {
-                    text: qsTr("开始")
-                    iconName: "play"
-                    primary: true
-                    onClicked: veyra.resumeLastSource()
-                }
-            }
-        }
-
-        // .recent: 692 wide, left-aligned, wrapping; "最近" in --v-t3 then 28px chips
-        // with a film/image icon. Present only when there are recent files; a chip
-        // whose file is gone is dimmed and does nothing (clicking it cannot open it).
-        Flow {
-            id: recent
-            Layout.alignment: Qt.AlignHCenter
-            Layout.preferredWidth: srcGrid.width
-            visible: veyra.recentFiles.length > 0
-            spacing: 8
-            Text {
-                height: 28
-                verticalAlignment: Text.AlignVCenter
-                text: qsTr("最近")
-                color: Theme.t3
-                font.family: Theme.fontUi
-                font.pixelSize: 12
-            }
-            Repeater {
-                model: veyra.recentFiles
-                delegate: Rectangle {
-                    id: chip
-                    required property var modelData
-                    readonly property bool isImage: /\.(png|jpe?g|bmp|webp|tiff?)$/i.test(modelData.path)
-                    width: chipRow.implicitWidth + 22
-                    height: 28
-                    radius: 99
-                    opacity: modelData.exists ? 1 : 0.45
-                    color: chipHover.hovered && modelData.exists ? Qt.rgba(1, 1, 1, 0.08) : Qt.rgba(1, 1, 1, 0.04)
-                    border.width: 1
-                    border.color: Theme.stroke
-                    Row {
-                        id: chipRow
-                        anchors.centerIn: parent
-                        spacing: 7
-                        VIcon {
-                            anchors.verticalCenter: parent.verticalCenter
-                            name: chip.isImage ? "image" : "film"
-                            size: 14
-                            color: chipText.color
-                        }
-                        Text {
-                            id: chipText
-                            anchors.verticalCenter: parent.verticalCenter
-                            text: modelData.label
-                            color: chipHover.hovered && modelData.exists ? Theme.t1 : Theme.t2
-                            font.family: Theme.fontUi
-                            font.pixelSize: 12
-                        }
-                    }
-                    ToolTip.visible: chipHover.hovered && !modelData.exists
-                    ToolTip.text: qsTr("文件已不存在")
-                    HoverHandler { id: chipHover; cursorShape: modelData.exists ? Qt.PointingHandCursor : Qt.ArrowCursor }
-                    TapHandler { onTapped: if (modelData.exists) veyra.openPath(modelData.path) }
-                }
-            }
-        }
     }
 
     // [data-in] entrance order from pages-a.js (the source cards rise from their delegate, --d 2-5).
     VRise { target: mark; d: 0 }
     VRise { target: hello; d: 1 }
-    VRise { target: resume; d: 6 }
-    VRise { target: recent; d: 7 }
 }

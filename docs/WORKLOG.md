@@ -8711,3 +8711,18 @@ High5总18.74ms/GPU67.8%同样绿但仅33fps，已大量reduced/seed/skip；完�
 分析命令Python -B scripts/acceptance/vfg-diagnosis-report.py，只读原始日志重算analysis.json。prepare早期utf8-sig编码名失败，改utf-8-sig后成功，失败时未建app/基线；分析初次假定所有admission都有admittedPairs而KeyError，后修缺字段及行尾解释重复key覆盖实际值，重算JSON。没有将这些脚本失败当产品错误或通过证据。audit核对全部其他工作树及原发布包/五VFG DLL未变；Python AST、git diff --check及25组最终收据保存verify/vfg-diagnosis-20261007/final.json。自查不冒称独立Reviewer。
 
 本轮产物统一E:/项目/Veyra/{archives,tests,logs,tmp,verify}/vfg-diagnosis-20261007；保留一份私有app、25组配置与必要日志用于后续A/B，未删其他文件、未重复旧被拒清理操作。本轮只完成排查，产品优化尚未实施，未验证全屏/其他GPU驱动/采集串流/全片长稳/物理显示时序。
+
+
+## 2026-10-19 Veyra Plus initial source fork
+
+User-authorized source fork: tpga001/Veyra-Plus, browser-enhance branch, upstream 2.0.6 base e1f6952. Preserve installed app, profiles, active sessions and original source worktree.
+
+Carried forward browser metadata/capture/overlay, GPU preview/comparison, GPUPixel basic beauty, resident/independent player processes, subtitles, desktop controls, source-sized RTX processing, display monitoring, scoped capture/UI fixes and SF310.9.16 packaging identity. See FORK_STATUS.md for evidence limits; product bytes are copied from the backed-up source snapshot, not reimplemented.
+
+Full local source and Git metadata were archived before preparation. Excluded local stage reports, private media/logs/captures, local WORKLOG additions and 13 machine-specific acceptance tools. Retained general product/unit/integration code, licenses and provenance. Added fork README/status/build/roadmap/contributor instructions and cache/credential ignore rules; inherited star-history automation is manual-only on this branch.
+
+Publication validation: source hash comparison, CMake file references, Python syntax, credential/prohibited-new-binary scan, and node --test browser-extension/tests/*.test.cjs. Local receipts stay outside Git. No new product build, GPU benchmark, displayed-FPS acceptance, installer or Runtime Pack release is claimed.
+
+Hermes was invoked for a bounded read-only source-publication review, exited 1 without a usable report, and the primary agent completed deterministic checks with an independent review. No Hermes configuration changed. Preparation initially used a Python 3.9-incompatible write_text argument, failed before document writes, then used UTF-8 byte writes; preserved the failure record.
+
+Publication check results: 1,869 carried files matched the archived source byte-for-byte; all current original source files/status stayed unchanged. No credential-pattern hits or newly added prohibited binaries; CMake local references and changed JSON/Python syntax passed. Extension CPU tests: Node v24.19.0, 103 passed / 0 failed. Initial system Node lacked --test, so the bundled runtime was used without changing the system. Static-audit first pass misread external SDK headers/generated resource templates and inherited whitespace; preserved that receipt and narrowed checks to actual local paths and publication-introduced issues. Existing ten whitespace-only QML lines and four EOF-blank warnings were retained with matching original source hashes.

@@ -14,6 +14,7 @@ constexpr std::array<EffectInfo, effectTypeCount> kCatalog{{
     {EffectType::Protection, effectTypeName(EffectType::Protection), "NR 保护区域", 1, false, false, false, false, false},
     {EffectType::VideoHdr, effectTypeName(EffectType::VideoHdr), "RTX Video HDR", 1, false, false, true, false, false},
     {EffectType::FrameGeneration, effectTypeName(EffectType::FrameGeneration), "补帧", 1, false, true, false, false, false},
+    {EffectType::Beauty, effectTypeName(EffectType::Beauty), "美颜 · GPUPixel", 1, false, false, false, false, false},
 }};
 } // namespace
 
@@ -239,6 +240,7 @@ ChainValidation validateChain(const EffectChain& chain) {
             return {false, "节点模式已取消 NR 保护区域，请迁移旧节点配置"};
         if(node.type==EffectType::NrEnhance&&!pipeline::validNrSizePolicy(node.nr.sizePolicy))
             return {false, "NR 内部处理分辨率非法"};
+        if(node.type==EffectType::Beauty&&!node.beauty.valid())return {false,"美颜参数无效"};
         ++seen[index];
         if (node.enabled) lastEnabled = i;
     }
@@ -273,6 +275,12 @@ ChainValidation validateChain(const EffectChain& chain) {
                 if (chain.nodes[j].type != EffectType::FrameGeneration) return {false, "RTX Video HDR 之后只能接补帧"};
             }
         }
+    }
+    // The current GPU dispatcher only implements one beauty pass at the SDR
+    // tail. Reject unsupported processing orders even when the UI can draw them.
+    for(uint32_t i=0;i<chain.nodeCount;++i)if(chain.nodes[i].type==EffectType::Beauty&&chain.nodes[i].enabled){
+        for(uint32_t j=0;j<i;++j)if(chain.nodes[j].enabled&&(chain.nodes[j].type==EffectType::VideoHdr||chain.nodes[j].type==EffectType::FrameGeneration))return {false,"美颜固定在 HDR 与补帧之前"};
+        for(uint32_t j=i+1;j<chain.nodeCount;++j)if(chain.nodes[j].enabled&&chain.nodes[j].type!=EffectType::VideoHdr&&chain.nodes[j].type!=EffectType::FrameGeneration)return {false,"美颜固定在超分、NR 与调色之后"};
     }
     const ChainNrParams* firstNr=nullptr;
     for(uint32_t i=0;i<chain.nodeCount;++i){
@@ -321,6 +329,7 @@ EffectChain toChain(const EnhancementSettings& settings) {
         nr.nr.sizePolicy = layer.sizePolicy;
     }
     append(EffectType::Protection, settings.protection.enabled).protection = settings.protection;
+    append(EffectType::Beauty, settings.beauty.enabled).beauty = settings.beauty;
     append(EffectType::VideoHdr, settings.videoHdr.enabled).videoHdr = settings.videoHdr;
     append(EffectType::FrameGeneration, settings.multiplier > 1);
     return chain;
@@ -387,6 +396,7 @@ void fromChain(const EffectChain& chain, EnhancementSettings& settings) {
     settings.lowLatency = false;
     settings.protection = ProtectionSettings{};
     settings.videoHdr = VideoHdrSettings{};
+    settings.beauty = BeautySettings{};
     settings.multiplier = 1;
     settings.fgStrictAdmission = chain.fgStrictAdmission;
     for (uint32_t i = 0; i < std::min(chain.nodeCount,kMaxChainNodes); ++i) {
@@ -429,6 +439,9 @@ void fromChain(const EffectChain& chain, EnhancementSettings& settings) {
                 settings.protection.enabled = node.enabled;
             }
             break;
+        case EffectType::Beauty:
+            settings.beauty=node.beauty;settings.beauty.enabled=node.enabled;
+            break;
         case EffectType::VideoHdr:
             settings.videoHdr = node.videoHdr;
             settings.videoHdr.enabled = node.enabled;
@@ -448,7 +461,8 @@ ChainValidation compileChainExecutionPlan(const EffectChain& chain, const ChainE
     if (chain.mode != ChainMode::List && chain.mode != ChainMode::Node) return {false, "未知链路模式"};
     const auto validation = validateChain(chain);
     if (!validation.accepted) return validation;
-    if (!request.source.valid() || !pipeline::validSrTarget(request.srTarget))
+    if (!request.source.valid() || !pipeline::validSrTarget(request.srTarget) ||
+        (request.srPlaybackExtent!=pipeline::Extent{}&&!request.srPlaybackExtent.valid()))
         return {false, "执行计划尺寸或超分目标非法"};
 
     // Retain storage ordinals even when an earlier instance is disabled. This
@@ -465,7 +479,8 @@ ChainValidation compileChainExecutionPlan(const EffectChain& chain, const ChainE
     }
     nrFirst = nrFirst && !request.stillImage && !request.exportJob;
     const auto srExtent = pipeline::ResolutionPlan::make(request.source, true,
-        pipeline::NrSizePolicy::Native, true, 0, request.srTarget).base;
+        pipeline::NrSizePolicy::Native, true, 0, request.srTarget, false,
+        request.stillImage||request.exportJob?pipeline::Extent{}:request.srPlaybackExtent).base;
     ChainExecutionPlan plan;
     auto cursor = request.source;
     const auto append = [&](uint32_t index) {
@@ -494,9 +509,9 @@ ChainValidation compileChainExecutionPlan(const EffectChain& chain, const ChainE
     } else {
         const std::array<EffectType, effectTypeCount> order = nrFirst
             ? std::array{EffectType::Color, EffectType::NrEnhance, EffectType::Protection,
-                EffectType::SuperResolution, EffectType::VideoHdr, EffectType::FrameGeneration}
+                EffectType::SuperResolution, EffectType::Beauty, EffectType::VideoHdr, EffectType::FrameGeneration}
             : std::array{EffectType::Color, EffectType::SuperResolution, EffectType::NrEnhance,
-                EffectType::Protection, EffectType::VideoHdr, EffectType::FrameGeneration};
+                EffectType::Protection, EffectType::Beauty, EffectType::VideoHdr, EffectType::FrameGeneration};
         for (const auto type : order)
             for (uint32_t i = 0; i < chain.nodeCount; ++i)
                 if (chain.nodes[i].type == type) append(i);
@@ -621,6 +636,7 @@ bool ChainSession::select(ChainMode mode) {
 }
 
 bool requiresGraphRebuild(const EnhancementSettings& previous, const EnhancementSettings& next) {
+    if(previous.beauty.enabled!=next.beauty.enabled)return true;
     if(!previous.sameNrTopology(next))return true;
     // Everything the graph allocates or branches on. Live uniform parameters
     // (NR model/residual sliders, colour values, protection rectangles, audio,
@@ -640,6 +656,8 @@ bool requiresGraphRebuild(const EnhancementSettings& previous, const Enhancement
     if ((previous.nrHoldStrength > 0.0f) != (next.nrHoldStrength > 0.0f)) return true;
     if (previous.nrPolicy != next.nrPolicy) return true;
     if (previous.srTarget != next.srTarget) return true;
+    if (previous.srPlaybackExtent != next.srPlaybackExtent) return true;
+    if (previous.videoSrInputExtent != next.videoSrInputExtent) return true;
     if (previous.frameGenerationBackend != next.frameGenerationBackend) return true;
     if (previous.vfgQuality != next.vfgQuality) return true;
     if (previous.opticalFlowBackend != next.opticalFlowBackend) return true;

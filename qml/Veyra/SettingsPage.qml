@@ -14,6 +14,7 @@ import QtQuick.Layouts
 VPage {
     id: root
     signal requestPage(string page)
+    readonly property bool localPlayer: typeof veyraDesktop !== "undefined" && veyraDesktop.localPlayer
 
     property string section: "look"
     // The shortcut row waiting for a new key ("" = none).
@@ -272,6 +273,36 @@ VPage {
                     }
                     VGroup {
                         VRow {
+                            label: qsTr("登录时启动")
+                            hint: root.localPlayer ? qsTr("由浏览器常驻进程管理") : qsTr("登录后在托盘运行，不打断当前工作")
+                            VSwitch {
+                                objectName: "set-login-startup"
+                                enabled: !root.localPlayer
+                                checked: typeof veyraDesktop !== "undefined" && veyraDesktop.loginStartup
+                                onToggled: enabled => { if (!root.localPlayer && typeof veyraDesktop !== "undefined") veyraDesktop.loginStartup = enabled }
+                            }
+                        }
+                        VRow {
+                            label: qsTr("最小化收到托盘")
+                            hint: root.localPlayer ? qsTr("由浏览器常驻进程管理；本地播放窗口最小化到任务栏") : qsTr("隐藏任务栏按钮；点击折叠区的 Veyra 图标恢复窗口")
+                            VSwitch {
+                                objectName: "set-minimize-to-tray"
+                                enabled: !root.localPlayer
+                                checked: typeof veyraDesktop !== "undefined" && veyraDesktop.minimizeToTray
+                                onToggled: enabled => { if (!root.localPlayer && typeof veyraDesktop !== "undefined") veyraDesktop.minimizeToTray = enabled }
+                            }
+                        }
+                        VRow {
+                            label: qsTr("关闭窗口收到托盘")
+                            hint: root.localPlayer ? qsTr("由浏览器常驻进程管理；本地播放窗口关闭即退出") : qsTr("常驻进程关闭窗口后继续浏览器增强，可从托盘退出")
+                            VSwitch {
+                                objectName: "set-close-to-tray"
+                                enabled: false
+                                checked: typeof veyraDesktop !== "undefined" && veyraDesktop.closeToTray
+                                onToggled: enabled => { if (!root.localPlayer && typeof veyraDesktop !== "undefined") veyraDesktop.closeToTray = enabled }
+                            }
+                        }
+                        VRow {
                             label: qsTr("打开时的默认页面")
                             hint: qsTr("首页 = 选择片源的页面（点顶部 Logo 也能回到这里）")
                             VSeg {
@@ -300,15 +331,6 @@ VPage {
                                 options: sizes
                                 value: (sizes.find(o => o.id === (veyra.preferences.windowSize || "1280x800")) || sizes[0]).label
                                 onPicked: id => veyra.setPreference("windowSize", id)
-                            }
-                        }
-                        VRow {
-                            label: qsTr("启动后自动继续上次内容")
-                            hint: qsTr("视频恢复上次进度；采集卡沿用上次设备与设置")
-                            VSwitch {
-                                objectName: "set-auto-resume"
-                                checked: !!veyra.preferences.autoResume
-                                onToggled: v => veyra.setPreference("autoResume", v)
                             }
                         }
                         VRow {

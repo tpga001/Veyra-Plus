@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cwctype>
 #include <cctype>
 #include <cstring>
 #include <filesystem>
@@ -345,6 +346,124 @@ SubtitleTrack loadSubtitleFile(const std::wstring& path){
     return track;
 }
 
+
+namespace {
+int subtitleExtensionRank(const std::wstring& extension){
+    const auto name=lower(extension);
+    if(name==L".srt")return 0;
+    if(name==L".ass")return 1;
+    if(name==L".ssa")return 2;
+    if(name==L".vtt")return 3;
+    return -1;
+}
+std::wstring sidecarLanguage(std::wstring suffix){
+    suffix=lower(suffix);
+    // Common filename aliases, followed optionally by accessibility/forced tags.
+    const auto dot=suffix.find(L'.');
+    auto language=suffix.substr(0,dot);
+    if(dot!=std::wstring::npos){
+        size_t begin=dot+1;
+        while(begin<suffix.size()){
+            const auto end=suffix.find(L'.',begin);
+            const auto tag=suffix.substr(begin,end==std::wstring::npos?end:end-begin);
+            if(tag!=L"forced"&&tag!=L"sdh"&&tag!=L"cc"&&tag!=L"hi"&&tag!=L"default")return {};
+            if(end==std::wstring::npos)break;
+            begin=end+1;
+            if(begin==suffix.size())return {};
+        }
+    }
+    static const std::map<std::wstring,std::wstring> aliases={
+        {L"zh",L"zh"},{L"zho",L"zh"},{L"chi",L"zh"},{L"中文",L"zh"},
+        {L"chs",L"zh-CN"},{L"zh-cn",L"zh-CN"},{L"zh-hans",L"zh-CN"},{L"简体",L"zh-CN"},
+        {L"cht",L"zh-TW"},{L"zh-tw",L"zh-TW"},{L"zh-hant",L"zh-TW"},{L"繁体",L"zh-TW"},
+        {L"en",L"en"},{L"eng",L"en"},{L"english",L"en"},{L"英文",L"en"},
+        {L"ja",L"ja"},{L"jpn",L"ja"},{L"jp",L"ja"},{L"日语",L"ja"},
+        {L"ko",L"ko"},{L"kor",L"ko"},{L"韩语",L"ko"},
+        {L"fr",L"fr"},{L"fra",L"fr"},{L"fre",L"fr"},
+        {L"de",L"de"},{L"deu",L"de"},{L"ger",L"de"},
+        {L"es",L"es"},{L"spa",L"es"},{L"it",L"it"},{L"ita",L"it"},
+        {L"pt",L"pt"},{L"por",L"pt"},{L"ru",L"ru"},{L"rus",L"ru"},
+        {L"ar",L"ar"},{L"ara",L"ar"},{L"th",L"th"},{L"tha",L"th"},
+        {L"vi",L"vi"},{L"vie",L"vi"},{L"id",L"id"},{L"ind",L"id"},
+        {L"nl",L"nl"},{L"nld",L"nl"},{L"dut",L"nl"},{L"pl",L"pl"},{L"pol",L"pl"},
+        {L"tr",L"tr"},{L"tur",L"tr"},{L"hi",L"hi"},{L"hin",L"hi"},
+        {L"sv",L"sv"},{L"swe",L"sv"},{L"uk",L"uk"},{L"ukr",L"uk"}
+    };
+    if(const auto found=aliases.find(language);found!=aliases.end())return found->second;
+    // BCP-47 region suffixes such as en-US; only known language bases qualify.
+    const auto dash=language.find(L'-');
+    if(dash!=std::wstring::npos){
+        const auto base=aliases.find(language.substr(0,dash));
+        const auto region=language.substr(dash+1);
+        if(base!=aliases.end()&&region.size()==2&&
+           std::all_of(region.begin(),region.end(),[](wchar_t c){return c>=L'a'&&c<=L'z';})){
+            auto result=base->second+L"-"+region;
+            for(size_t k=result.size()-2;k<result.size();++k)result[k]=wchar_t(std::towupper(result[k]));
+            return result;
+        }
+    }
+    return {};
+}
+}
+std::vector<SubtitleTrack> loadExternalSubtitleTracks(const std::wstring& mediaPath,std::stop_token stop){
+    std::vector<SubtitleTrack> tracks;
+    if(mediaPath.empty()||stop.stop_requested()||mediaPath.find(L"://")!=std::wstring::npos
+       ||mediaPath.starts_with(L"capture:")||mediaPath.starts_with(L"capture2:")
+       ||mediaPath.starts_with(L"screen:")||mediaPath.starts_with(L"remoteplay:")
+       ||mediaPath.starts_with(L"moonlight:")||mediaPath.starts_with(L"xbox:"))return tracks;
+    const std::filesystem::path media(mediaPath);
+    auto directory=media.parent_path();if(directory.empty())directory=L".";
+    const auto stem=lower(media.stem().wstring());
+    if(stem.empty())return tracks;
+    struct Candidate {std::filesystem::path path;std::wstring language,key;int rank=0;};
+    std::map<std::wstring,Candidate> found;
+    auto collect=[&](const std::filesystem::path& file){
+        const int rank=subtitleExtensionRank(file.extension().wstring());if(rank<0)return;
+        const auto candidateStem=lower(file.stem().wstring());
+        std::wstring language;
+        if(candidateStem!=stem){
+            if(!candidateStem.starts_with(stem+L"."))return;
+            language=sidecarLanguage(candidateStem.substr(stem.size()+1));if(language.empty())return;
+        }
+        std::error_code ec;if(!std::filesystem::is_regular_file(file,ec))return;
+        const auto key=lower(file.filename().wstring());
+        // Directory spelling supersedes the direct probe on case-insensitive Windows.
+        found.insert_or_assign(key,Candidate{file,std::move(language),key,rank});
+    };
+    // Always check strict same-name tracks even when a large directory hits the scan budget.
+    for(const auto* extension:{L".srt",L".ass",L".ssa",L".vtt"}){
+        if(stop.stop_requested())return {};
+        auto exact=media;exact.replace_extension(extension);collect(exact);
+    }
+    std::error_code ec;size_t scanned=0;
+    for(std::filesystem::directory_iterator it(directory,std::filesystem::directory_options::skip_permission_denied,ec),end;
+        !ec&&it!=end&&!stop.stop_requested();it.increment(ec)){
+        if(++scanned>10000){log::warn("subtitle","sidecar directory scan stopped at 10000 entries");break;}
+        collect(it->path());
+    }
+    if(stop.stop_requested())return {};
+    std::vector<Candidate> ordered;ordered.reserve(found.size());
+    for(auto& [key,candidate]:found)ordered.push_back(std::move(candidate));
+    std::sort(ordered.begin(),ordered.end(),[](const auto& a,const auto& b){
+        if(a.language.empty()!=b.language.empty())return a.language.empty();
+        if(a.language!=b.language)return a.language<b.language;
+        if(a.rank!=b.rank)return a.rank<b.rank;
+        return a.key<b.key;
+    });
+    for(const auto& candidate:ordered){
+        if(stop.stop_requested())return {};
+        if(tracks.size()==64){log::warn("subtitle","sidecar track limit reached (64)");break;}
+        try{
+            auto track=loadSubtitleFile(candidate.path.wstring());if(!track.usable())continue;
+            track.language=candidate.language;
+            track.name=std::format(L"外挂 · {}",candidate.path.filename().wstring());
+            tracks.push_back(std::move(track));
+        }catch(const std::exception& e){log::warn("subtitle",std::format("sidecar skipped: {}",e.what()));}
+    }
+    log::info("subtitle",std::format("external discovery tracks={} scanned={}",tracks.size(),scanned));
+    return tracks;
+}
+
 std::vector<const SubtitleCue*> cuesAt(const SubtitleTrack& track,double seconds,size_t limit){
     std::vector<const SubtitleCue*> found;
     if(track.starts.empty())return found;
@@ -615,13 +734,9 @@ struct SubtitleLoader::Impl {
             try{
                 std::vector<SubtitleTrack> external;
                 if(path.empty()||path.starts_with(L"capture:")||path.starts_with(L"capture2:")||path.starts_with(L"remoteplay:")||path.starts_with(L"moonlight:")||path.starts_with(L"xbox:")||path.starts_with(L"screen:")){publish({},true);continue;}
-                for(const wchar_t* extension:{L".srt",L".ass",L".ssa",L".vtt"}){
-                    if(stop.stop_requested())break;
-                    auto candidate=std::filesystem::path(path);candidate.replace_extension(extension);
-                    std::error_code ec;if(!std::filesystem::exists(candidate,ec))continue;
-                    auto track=loadSubtitleFile(candidate.wstring());if(!track.usable())continue;
-                    track.name=std::format(L"外挂 · {}",candidate.filename().wstring());external.push_back(std::move(track));break;
-                }
+                external=loadExternalSubtitleTracks(path,stop);
+                if(stop.stop_requested())continue;
+                if(!external.empty())publish(external,false);
                 auto embedded=loadEmbeddedSubtitleTracks(path,stop,[&](const auto& tracks){auto listing=external;listing.insert(listing.end(),tracks.begin(),tracks.end());publish(std::move(listing),false);});
                 for(auto& track:embedded)external.push_back(std::move(track));
                 publish(std::move(external),true);
@@ -754,7 +869,7 @@ SubtitleAlignResult alignSubtitleToAudio(const std::wstring& mediaPath,const Sub
         if(score-penalty>bestScore){bestScore=score-penalty;bestShift=shift;}
     }
     result.ok=bestScore>0.25;
-    result.offsetMs=int(std::lround(bestShift*kStepSeconds*1000.0));
+    result.offsetMs=int(std::clamp<int64_t>(int64_t(track.offsetMs)+std::llround(bestShift*kStepSeconds*1000.0),std::numeric_limits<int>::min(),std::numeric_limits<int>::max()));
     result.score=bestScore;
     result.detail=result.ok?std::format(L"相关性 {:.2f}，建议偏移 {} ms",bestScore,result.offsetMs)
                           :std::format(L"相关性只有 {:.2f}，未找到可靠偏移（字幕可能与视频不匹配）",bestScore);

@@ -775,7 +775,7 @@ if(screenFill&&currentFile.starts_with(L"screen:")&&s.running){
             if(index<0||size_t(index)>=subtitleTracks.size())return;
             const auto& track=subtitleTracks[size_t(index)];
             if(!track.usable())return;
-            const double position=s.position+double(track.offsetMs)/1000.0;
+            const double position=s.position-double(track.offsetMs)/1000.0;
             for(const auto* cue:veyra::engine::cuesAt(track,position,3)){
                 veyra::ui::SubtitleLine line;
                 line.text=cue->text;

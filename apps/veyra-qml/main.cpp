@@ -54,8 +54,12 @@
 #include "veyra/engine/PresentationGeometry.h"
 #include "veyra/gfx/PresentationHooks.h"
 #include "veyra/ui/QmlDataDirectory.h"
+#include "veyra/ui/DesktopIntegration.h"
+#include "veyra/ui/LocalPlayerProfile.h"
+#include "veyra/ui/UiResponsivenessMonitor.h"
 #include "veyra/ui/QmlPlayerBridge.h"
 #include "veyra/ui/ThumbnailProvider.h"
+#include "BrowserPreviewHost.h"
 
 using namespace veyra;
 
@@ -460,8 +464,14 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
             else if (std::wstring(args[i]) == L"--obs-game-capture") obsGameCaptureArg = true;
             else if (std::wstring(args[i]) == L"--overlay-compat-restart") overlayCompatRestart = true;
         }
+        QStringList earlyArguments;
+        for (int i = 0; args && i < count; ++i) earlyArguments << QString::fromWCharArray(args[i]);
+        const bool earlyLocalPlayer = earlyArguments.contains(QStringLiteral("--local-player")) ||
+            !ui::DesktopIntegration::explicitLocalOpenFile(earlyArguments).isEmpty();
         if (args) LocalFree(args);
-        QFile prefs(QString::fromStdWString((dir / L"qml-preferences.v1.json").wstring()));
+        const auto localPrefs = dir / L"local-player-defaults" / L"qml-preferences.v1.json";
+        QFile prefs(QString::fromStdWString(((earlyLocalPlayer && std::filesystem::is_regular_file(localPrefs))
+            ? localPrefs : dir / L"qml-preferences.v1.json").wstring()));
         if (prefs.open(QIODevice::ReadOnly)) {
             const auto saved = QJsonDocument::fromJson(prefs.readAll()).object();
             uiScale = saved.value(QStringLiteral("uiScale")).toInt();
@@ -586,12 +596,6 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
     app.setOrganizationName(QStringLiteral("Veyra"));
     veyra::log::info("app", "Veyra QML session started");
 
-    engine::EngineController controller;
-
-    // The window exists before QML loads so the engine can be handed a valid
-    // HWND as soon as the user opens something.
-    g_video = createVideoWindow();
-
     // Keep 2.0.0 settings separate from 1.4.4 so the old executable remains a
     // working rollback. An explicit data directory is for isolated runs and is
     // never populated from the user's old settings.
@@ -610,6 +614,32 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
         if (importAt > 0 && importAt + 1 < early.size())
             legacyDirectory = std::filesystem::path(early.at(importAt + 1).toStdWString());
     }
+    const auto desktopArguments = QCoreApplication::arguments();
+    const bool localPlayer = desktopArguments.contains(QStringLiteral("--local-player")) ||
+        !ui::DesktopIntegration::explicitLocalOpenFile(desktopArguments).isEmpty();
+    const auto sharedDataDirectory = dataDirectory;
+    ui::DesktopIntegration::Options desktopOptions;
+    desktopOptions.localPlayer = localPlayer;
+    desktopOptions.residentBrowser = !localPlayer;
+    desktopOptions.trayLaunch = !localPlayer && desktopArguments.contains(QStringLiteral("--tray"));
+    desktopOptions.timedExit = desktopArguments.contains(QStringLiteral("--exit-after"));
+    desktopOptions.backgroundProbe = desktopArguments.contains(QStringLiteral("--background-probe"));
+    ui::DesktopIntegration desktop(QString::fromStdWString(dataDirectory.wstring()), desktopOptions);
+    const auto instance = desktop.acquireInstance(desktopArguments);
+    if (instance == ui::DesktopIntegration::InstanceResult::Forwarded) return 0;
+    if (instance != ui::DesktopIntegration::InstanceResult::Primary) {
+        veyra::log::error("desktop", desktop.errorString().toStdString());
+        MessageBoxW(nullptr, L"Veyra is already starting or cannot create its user desktop entry. Please try again.", L"Veyra", MB_OK | MB_ICONERROR);
+        return 2;
+    }
+    if (desktopArguments.contains(QStringLiteral("--desktop-setup"))) {
+        // Explicit one-time installation action. Daily login uses --tray only.
+        const bool ok = desktop.configureDesktop();
+        veyra::log::info("desktop", ok ? "desktop setup saved; login startup, close-to-tray and browser preference enabled"
+            : "desktop setup failed");
+        veyra::Logger::instance().flush();
+        return ok ? 0 : 2;
+    }
     if (!explicitDataDirectory) {
         const auto migration = ui::prepareQmlDataDirectory(legacyDirectory, dataDirectory);
         if (!migration.ok) {
@@ -619,8 +649,35 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
         veyra::log::info("app", std::format("2.0.0 data directory ready; copied {} legacy files",
                                              migration.copied));
     }
-    ui::QmlPlayerBridge bridge(controller, dataDirectory);
+    std::unique_ptr<ui::LocalPlayerProfile> playerProfile;
+    if (localPlayer) {
+        playerProfile = std::make_unique<ui::LocalPlayerProfile>(QString::fromStdWString(sharedDataDirectory.wstring()));
+        if (!playerProfile->ready()) {
+            veyra::log::error("desktop", playerProfile->error().toStdString());
+            MessageBoxW(nullptr, L"无法创建独立播放器设置目录。", L"Veyra", MB_OK | MB_ICONERROR);
+            return 2;
+        }
+        dataDirectory = std::filesystem::path(playerProfile->path().toStdWString());
+    }
+    veyra::log::info("desktop", localPlayer ? "process role=local-player" : "process role=browser-resident");
+    engine::EngineController controller;
+    g_video = createVideoWindow();
+    ui::QmlPlayerBridge bridge(controller, dataDirectory, ui::QmlPlayerBridge::OnlineSubtitleFactory{}, !localPlayer);
+    bridge.setLocalFileLauncher([&desktop](const QString& path) { return desktop.launchLocalPlayer(path); });
+    QObject::connect(&bridge, &ui::QmlPlayerBridge::residentBrowserRequested, &desktop, &ui::DesktopIntegration::showResidentWindow);
     bridge.attachVideoWindow(reinterpret_cast<qulonglong>(g_video));
+    ui::VideoOutputPublisher outputPublisher(QString::fromStdWString(sharedDataDirectory.wstring()),
+        localPlayer ? "local-player" : "browser-resident");
+    outputPublisher.setSourceProvider([&bridge] { return bridge.videoOutputSource(); });
+    QObject::connect(&desktop, &ui::DesktopIntegration::browserEnableRequested, &bridge,
+        [&bridge](bool enabled) { bridge.applyBrowserEnabled(enabled); });
+    QObject::connect(&bridge, &ui::QmlPlayerBridge::browserUserPreferenceChanged, &desktop,
+        &ui::DesktopIntegration::rememberBrowserUserChoice);
+    QObject::connect(&bridge, &ui::QmlPlayerBridge::browserChanged, &desktop,
+        [&desktop, &bridge] { desktop.setBrowserActual(bridge.browserEnabled()); });
+    QObject::connect(&desktop, &ui::DesktopIntegration::openFileRequested, &bridge,
+        [&desktop](const QString& path) { desktop.launchLocalPlayer(path); });
+    QObject::connect(&desktop, &ui::DesktopIntegration::notice, &bridge, &ui::QmlPlayerBridge::notice);
 
     // Qt reports QML failures through its own message handler. Routing them to
     // the log is the difference between "it did not load" and why.
@@ -641,6 +698,7 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
                      [thumbnails](const QString& path) { thumbnails->setSource(path); });
     engine.addImportPath(QCoreApplication::applicationDirPath() + "/qml");
     engine.rootContext()->setContextProperty(QStringLiteral("veyra"), &bridge);
+    engine.rootContext()->setContextProperty(QStringLiteral("veyraDesktop"), &desktop);
     bridge.setQmlEngine(&engine);   // Qt.uiLanguage drives the per-language font (Theme.qml)
 
     QObject::connect(&engine, &QQmlApplicationEngine::objectCreationFailed, &app,
@@ -671,6 +729,11 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
     //   --video-probe <normal|hidden|no-region|covers-only>  native-window diagnosis
     const QStringList args = QCoreApplication::arguments();
     QString openPath;
+    QString nativePreset;
+    bool starterPresets=false;
+    bool followDisplay=false;
+    bool enableBrowser=false;
+    bool backgroundProbe=false;
     QVariantMap testOptions;
     if(qEnvironmentVariableIsSet("VEYRA_TEST_DISABLE_PAUSED_UI_IDLE"))
         testOptions.insert(QStringLiteral("disablePausedUiIdle"),true);
@@ -678,9 +741,20 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
     // --exit-after: see the switch table. 0 means "run until closed".
     int exitAfterMs = 0;
     for (int i = 1; i < args.size(); ++i) {
+        if(args.at(i)==QStringLiteral("--background-probe")) { backgroundProbe=true;testOptions.insert(QStringLiteral("backgroundProbe"),true);continue; }
+        if(args.at(i)==QStringLiteral("--browser-enable")) { enableBrowser=true;continue; }
+        if(args.at(i)==QStringLiteral("--tray") || args.at(i)==QStringLiteral("--local-player")) continue;
+        if(args.at(i)==QStringLiteral("--open") && i+1<args.size()) { openPath=args.at(++i);continue; }
+        if(args.at(i)==QStringLiteral("--starter-presets")) { starterPresets=true;continue; }
+        if(args.at(i)==QStringLiteral("--native-preset")) {
+            if(i+1>=args.size())return 2;
+            nativePreset=args.at(++i);continue;
+        }
+
         const QString& a = args.at(i);
         const bool hasValue = i + 1 < args.size();
-        if (a == QLatin1String("--page") && hasValue) {
+        if(a == QLatin1String("--follow-display")) { followDisplay=true;
+        } else if (a == QLatin1String("--page") && hasValue) {
             bridge.setInitialPage(args.at(++i));
         } else if (a == QLatin1String("--tab") && hasValue) {
             testOptions.insert(QStringLiteral("tab"), args.at(++i));
@@ -738,17 +812,28 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
             openPath = a;
         }
     }
+    if(backgroundProbe&&(exitAfterMs<=0||exitAfterMs>300000)){
+        veyra::log::error("qml","background probe requires --exit-after between 1 and 300000 ms");
+        return 2;
+    }
     if (!testOptions.isEmpty() || testSize.isValid())
         veyra::log::info("qml", std::format("test switches: {} size={}x{}",
                                             QStringList(testOptions.keys()).join(',').toStdString(),
                                             testSize.width(), testSize.height()));
     veyra::log::info("qml-window", std::format("probe mode={}", videoProbeName()));
     engine.rootContext()->setContextProperty(QStringLiteral("vyTest"), testOptions);
+
+    if(starterPresets&&!bridge.installNativePlaybackPresets())return 2;
+    if(!nativePreset.isEmpty()) {
+        if(!bridge.selectNativePlaybackPreset(nativePreset))return 2;
+    }
+    if(followDisplay)bridge.setSrFollowDisplay(true);
+    // An explicit local file launch takes priority over background browser restoration.
+    const bool initialBrowser = !localPlayer && (enableBrowser || (openPath.isEmpty() && !backgroundProbe && desktop.browserWanted()));
+    if(initialBrowser)QTimer::singleShot(0,&bridge,[&bridge]{bridge.applyBrowserEnabled(true);});
     if (!openPath.isEmpty()) {
         QTimer::singleShot(600, &bridge, [&bridge, openPath] { bridge.openPath(openPath); });
-    } else {
-        QTimer::singleShot(600, &bridge, [&bridge] { bridge.autoResumeLastSource(); });
-    }
+    } // New sessions never automatically reopen a previous local video.
 
     engine.loadFromModule("Veyra", "Main");
 
@@ -763,6 +848,24 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
         return 1;
     }
     if (testSize.isValid()) window->resize(testSize);
+    QObject::connect(&desktop, &ui::DesktopIntegration::closingToTray, &bridge, [&bridge, window] {
+        if (window->visibility() != QWindow::FullScreen && window->visibility() != QWindow::Maximized &&
+            !window->property("cinema").toBool()) bridge.rememberWindowSize(window->width(), window->height());
+    });
+    bridge.setBrowserMonitorWindow(static_cast<qulonglong>(window->winId()));
+    desktop.attachWindow(window);
+    ui::UiResponsivenessMonitor uiMonitor(QString::fromStdWString(sharedDataDirectory.wstring()));
+    uiMonitor.attachWindow(window);
+    QObject::connect(&desktop, &ui::DesktopIntegration::showRequested, &uiMonitor, [&uiMonitor] { uiMonitor.noteAction("show"); });
+    QObject::connect(&bridge, &ui::QmlPlayerBridge::navigate, &uiMonitor, [&uiMonitor](const QString& page) {
+        if (page == "browser" || page == "pro" || page == "node") uiMonitor.noteAction("nav." + page);
+    });
+    QObject::connect(window, &QQuickWindow::beforeSynchronizing, &app, [] { ui::UiResponsivenessMonitor::setRenderStage(1); }, Qt::DirectConnection);
+    QObject::connect(window, &QQuickWindow::afterSynchronizing, &app, [] { ui::UiResponsivenessMonitor::setRenderStage(2); }, Qt::DirectConnection);
+    QObject::connect(window, &QQuickWindow::beforeRendering, &app, [] { ui::UiResponsivenessMonitor::setRenderStage(3); }, Qt::DirectConnection);
+    QObject::connect(window, &QQuickWindow::afterRendering, &app, [] { ui::UiResponsivenessMonitor::setRenderStage(4); }, Qt::DirectConnection);
+    QObject::connect(window, &QQuickWindow::frameSwapped, &app, [] { ui::UiResponsivenessMonitor::setRenderStage(5); }, Qt::DirectConnection);
+    ui::BrowserPreviewHost browserPreview(*window, bridge);
 
     // Fullscreen must own the whole monitor. Without telling the shell, the taskbar
     // stayed above the fullscreen picture on some systems (field report with the
@@ -817,9 +920,9 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
     if (exitAfterMs > 0) {
         // Self-terminating test run: the same teardown path as a user closing the
         // window, so the log a harness reads is complete either way.
-        QTimer::singleShot(exitAfterMs, &app, [window] {
-            veyra::log::info("qml", "exit-after elapsed: closing the window");
-            window->close();
+        QTimer::singleShot(exitAfterMs, &app, [&desktop] {
+            veyra::log::info("qml", "exit-after elapsed: explicitly quitting the application");
+            desktop.requestExit();
         });
     }
 
@@ -851,6 +954,12 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
     // swapchain from a 1x1 window. The native calls only run when a value changed.
     auto follow = [window, &bridge] {
         if (!g_video) return;
+        // BrowserPreviewHost owns an independent secondary target. The ordinary
+        // player HWND remains reserved for its primary source/swapchain.
+        if (bridge.sourceKind() == QLatin1String("browser")) {
+            if (IsWindowVisible(g_video)) ShowWindow(g_video, SW_HIDE);
+            return;
+        }
         // Only the pre-open hook attaches the popup and converts it to WS_CHILD.
         // GetParent() is null for an unattached WS_POPUP, so reparenting here on
         // every animation frame can starve input and timers before any source opens.
@@ -972,6 +1081,27 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
     // be verified end to end by a test rather than by a person clicking around;
     // it is not a user-facing feature.
     const int rc = app.exec();
+    browserPreview.detach();
+    // Both native targets must outlive all GPU work and SDK teardown.
+    controller.shutdown();
+    browserPreview.destroy();
+    // Explicit local diagnostic export after the UI loop; normal playback does
+    // not perform per-frame file I/O. The report declares ring overwrites.
+    const auto tracePath=qEnvironmentVariable("VEYRA_TEST_FRAME_TRACE_FILE");
+    if(!tracePath.isEmpty()){
+        controller.stop();
+        const auto traceStopDeadline=GetTickCount64()+5000;
+        while(!controller.idle()&&GetTickCount64()<traceStopDeadline)Sleep(10);
+        const bool tracePartial=!controller.idle();
+        const auto report=std::format("Trace export: workerIdle={} partial={} boundedTail=true\n",!tracePartial,tracePartial)
+            +veyra::Logger::instance().diagnosticReport();
+        QFile traceFile(tracePath);
+        if(traceFile.open(QIODevice::WriteOnly|QIODevice::NewOnly)){
+            const auto wrote=traceFile.write(report.data(),qint64(report.size()));
+            veyra::log::info("frame-trace-export",std::format("written={} recordsAreBoundedTail=true",wrote==qint64(report.size())));
+        }else veyra::log::warn("frame-trace-export","explicit diagnostic file could not be created");
+    }
+
     if (rc == 42) {
         restartProgram = QCoreApplication::applicationFilePath();
         // Preserve the selected profile, not transient capture/open/test flags.
@@ -984,6 +1114,7 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
         }
         if (app.property("veyraOverlayCompatRestart").toBool())
             restartArgs << QStringLiteral("--overlay-compat-restart");
+        if (localPlayer) restartArgs << QStringLiteral("--local-player");
         restartArgs << QStringLiteral("--page") << QStringLiteral("set");
     }
     if (g_video) { DestroyWindow(g_video); g_video = nullptr; }

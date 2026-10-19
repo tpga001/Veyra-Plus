@@ -2,6 +2,7 @@
 #include "veyra/gfx/D3D12DeviceContext.h"
 #include "veyra/gfx/CommandSlotRing.h"
 #include "veyra/Log.h"
+#include "veyra/diagnostics/SrProofPolicy.h"
 #include <wincodec.h>
 #include <wrl/client.h>
 #include <cstring>
@@ -40,6 +41,23 @@ static bool readPixels(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& ring,I
 bool readRgba8(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& ring,ID3D12Resource* tex,RgbaImage& img){
     return tex&&tex->GetDesc().Format==DXGI_FORMAT_R8G8B8A8_UNORM&&readPixels(ctx,ring,tex,img,4);
 }
+
+bool readLinearSdrRgba8ForDiagnostic(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& ring,ID3D12Resource* tex,RgbaImage& image) {
+    // Explicit paired-proof readback only. Never infer HDR-to-SDR from FP16.
+    // The caller must establish SDR; this format is also used by HDR paths.
+    if(!tex||tex->GetDesc().Format!=DXGI_FORMAT_R16G16B16A16_FLOAT)return false;
+    RgbaImage raw;if(!readPixels(ctx,ring,tex,raw,8))return false;
+    const uint64_t pixels=uint64_t(raw.width)*raw.height;
+    if(!pixels||pixels>SIZE_MAX/8||raw.pixels.size()!=pixels*8)return false;
+    image.width=raw.width;image.height=raw.height;image.pixels.resize(size_t(pixels)*4);
+    const auto& halfTables=diagnostics::srProofSdrHalfTables();
+    for(size_t i=0;i<size_t(pixels)*4;++i){
+        uint16_t half=0;std::memcpy(&half,raw.pixels.data()+i*2,2);
+        image.pixels[i]=halfTables[i%4==3?1:0][half];
+    }
+    return true;
+}
+
 bool saveHdrScreenshot(const std::wstring& path,gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& ring,ID3D12Resource* texture){
     const auto check=[](HRESULT hr,const char* stage){if(SUCCEEDED(hr))return true;log::error("hdr-screenshot",std::format("stage={} hr=0x{:08X}",stage,unsigned(hr)));return false;};
     if(!texture)return check(E_POINTER,"source-texture");

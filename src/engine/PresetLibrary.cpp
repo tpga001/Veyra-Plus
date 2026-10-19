@@ -492,7 +492,8 @@ ChainValidation PresetLibrary::applyToEditor(const PresetEntry& entry, NodeEdito
             case EffectType::Color: return 0;
             case EffectType::SuperResolution: return 1;
             case EffectType::NrEnhance: return 2;
-            case EffectType::VideoHdr: return 3;
+            case EffectType::Beauty: return 3;
+            case EffectType::VideoHdr: return 4;
             default: return 4;
             }
         };
@@ -642,7 +643,8 @@ std::string PresetLibrary::encodeEntries(const std::vector<PresetEntry>& entries
             return g.hdrCurve!=HdrCurveSettings{}||g.hdrMetadata!=HdrMetadataSettings{};}
         return false;};
     const bool tuning=std::any_of(entries_.begin(),entries_.end(),tuningOf);
-    const int version=std::max(minimumVersion, tuning?11:flow?10:correctionExtended?9:correction?8:vfg?7:rendering?6:globals?5:editor?4:layerSizes?3:multi?2:1);
+    const bool beauty=std::any_of(entries_.begin(),entries_.end(),[](const auto& e){return e.chain.countOf(EffectType::Beauty)>0;});
+    const int version=std::max(minimumVersion, beauty?12:tuning?11:flow?10:correctionExtended?9:correction?8:vfg?7:rendering?6:globals?5:editor?4:layerSizes?3:multi?2:1);
     o << "VEYRA_PRESET_LIBRARY " << version << '\n' << std::quoted(utf8(defaultName_)) << ' ' << entries_.size() << '\n';
     for (const auto& e : entries_) {
         o << std::quoted(utf8(e.name)) << ' ' << std::quoted(utf8(e.note)) << ' '
@@ -668,6 +670,7 @@ std::string PresetLibrary::encodeEntries(const std::vector<PresetEntry>& entries
               << n.videoHdr.middleGray << ' ' << n.videoHdr.peakNits << ' ';
             if(version>=3)o<<int(n.nr.sizePolicy)<<' ';
             if(version>=8){writeNrCorrection(o,n.nr.residual.correction,version>=9);o<<' ';}
+            if(version>=12)o<<n.beauty.enabled<<' '<<n.beauty.smoothing<<' '<<n.beauty.whitening<<' '<<n.beauty.detail<<' ';
             if (version>=2 && n.type == EffectType::Color) {
                 writeColorSettings(o, n.color, utf8(n.color.lutNameString()));
                 o << ' ';
@@ -706,7 +709,7 @@ bool PresetLibrary::parse(const std::string& data, std::vector<PresetEntry>& out
     std::string magic, quoted;
     int version = 0;
     size_t count = 0;
-    const int allowedVersion=maxVersion>0?std::min(maxVersion,11):11;
+    const int allowedVersion=maxVersion>0?std::min(maxVersion,12):12;
     if (!(in >> magic >> version) || magic != "VEYRA_PRESET_LIBRARY" || version < 1 || version > allowedVersion) { error = L"预设库格式或版本不支持"; return false; }
     if (!(in >> std::quoted(quoted) >> count) || count > 64) { error = L"预设库条目数非法"; return false; }
     def = wide(quoted);
@@ -749,7 +752,7 @@ bool PresetLibrary::parse(const std::string& data, std::vector<PresetEntry>& out
                 if (r.left > r.right) { std::swap(r.left, r.right); r.ellipse = true; }
             }
             if (!(in >> hdrEnabled >> node.videoHdr.contrast >> node.videoHdr.saturation >> node.videoHdr.middleGray >> node.videoHdr.peakNits)) { error = L"预设库 HDR 字段损坏"; return false; }
-            if (type < 0 || type >= int(EffectType::Count) || enabled < 0 || enabled > 1 || !validNrRuntime(static_cast<NrRuntime>(runtime)) ||
+            if (type < 0 || type >= (version>=12?int(EffectType::Count):6) || enabled < 0 || enabled > 1 || !validNrRuntime(static_cast<NrRuntime>(runtime)) ||
                 temporal < 0 || temporal > 1 || lowLatency < 0 || lowLatency > 1 || protEnabled < 0 || protEnabled > 1 || hdrEnabled < 0 || hdrEnabled > 1) {
                 error = L"预设库节点取值超出范围"; return false;
             }
@@ -765,6 +768,7 @@ bool PresetLibrary::parse(const std::string& data, std::vector<PresetEntry>& out
                 node.nr.sizePolicy=static_cast<pipeline::NrSizePolicy>(size);
             }
             if(version>=8&&!readNrCorrection(in,node.nr.residual.correction,version>=9)){error=L"预设库 NR 调控参数损坏";return false;}
+            if(version>=12){int beautyEnabled;if(!(in>>beautyEnabled>>node.beauty.smoothing>>node.beauty.whitening>>node.beauty.detail)||beautyEnabled<0||beautyEnabled>1||!node.beauty.valid()){error=L"预设库美颜参数损坏";return false;}node.beauty.enabled=beautyEnabled!=0;}
             if (version >= 2 && node.type == EffectType::Color) {
                 std::string lut;
                 if (!readColorSettings(in, node.color, lut, 19) ||
@@ -842,7 +846,8 @@ std::string ChainSessionStore::encode(const ChainSession& session) {
         return c.hdrCurve!=HdrCurveSettings{} || c.hdrMetadata!=HdrMetadataSettings{} ||
             (c.editor&&c.editor->globals&&(c.editor->globals->hdrCurve!=HdrCurveSettings{}||c.editor->globals->hdrMetadata!=HdrMetadataSettings{}));};
     const bool tuning=std::any_of(session.configurations.begin(),session.configurations.end(),tuningCustom);
-    const int version = tuning?6:vfg?5:rendering?4:editor ? (editor->globals ? 3 : 2) : 1;
+    const bool beauty=std::any_of(session.configurations.begin(),session.configurations.end(),[](const auto& c){return c.chain.countOf(EffectType::Beauty)>0||(c.editor&&c.editor->nodes.countOf(EffectType::Beauty)>0);});
+    const int version = beauty?7:tuning?6:vfg?5:rendering?4:editor ? (editor->globals ? 3 : 2) : 1;
     out << "VEYRA_CHAIN_SESSION " << version << '\n' << int(session.active) << ' ' << session.initialized[0] << ' ' << session.initialized[1];
     if(version>=4)out<<' '<<bool(editor);out<<'\n';
     std::vector<PresetEntry> entries;
@@ -896,7 +901,7 @@ bool ChainSessionStore::decode(const std::string& data, ChainSession& session, b
     std::istringstream in(data); in.imbue(std::locale::classic());
     std::string magic, body; int version = 0, active = 0, list = 0, node = 0;
     if (!(in >> magic >> version >> active >> list >> node) || magic != "VEYRA_CHAIN_SESSION" ||
-        (version < 1 || version > 6) || active < 0 || active > 1 || list != 1 || node < 0 || node > 1) return false;
+        (version < 1 || version > 7) || active < 0 || active > 1 || list != 1 || node < 0 || node > 1) return false;
     int hasEditor=version>=2?1:0;
     if(version>=4&&(!(in>>hasEditor)||hasEditor<0||hasEditor>1))return false;
     ChainSession parsed; parsed.active = ChainMode(active); parsed.initialized = {true, node != 0};
@@ -911,7 +916,7 @@ bool ChainSessionStore::decode(const std::string& data, ChainSession& session, b
     }
     if (!(in >> std::quoted(body))) return false;
     std::vector<PresetEntry> entries; std::wstring def, error;
-    if (!PresetLibrary::parse(body, entries, def, error, nullptr, true, 11) || entries.size() != 2 || !def.empty()) return false;
+    if (!PresetLibrary::parse(body, entries, def, error, nullptr, true, version>=7?12:11) || entries.size() != 2 || !def.empty()) return false;
     for (size_t i = 0; i < entries.size(); ++i) {
         if (entries[i].kind != ChainMode(i)) return false;
         parsed.configurations[i].chain = entries[i].chain;
@@ -945,7 +950,7 @@ bool ChainSessionStore::decode(const std::string& data, ChainSession& session, b
         }
         if (!(in >> std::quoted(body))) return false;
         entries.clear(); def.clear(); error.clear();
-        if (!PresetLibrary::parse(body, entries, def, error, nullptr, true, 11) || entries.size() != 1 ||
+        if (!PresetLibrary::parse(body, entries, def, error, nullptr, true, version>=7?12:11) || entries.size() != 1 ||
             !def.empty() || entries[0].kind != ChainMode::Node || entries[0].chain.nodeCount != count) return false;
         editor->nodes = std::move(entries[0].chain);
         for (uint32_t i = 0; i < count; ++i) {

@@ -1,12 +1,5 @@
-// 极简模式, rebuilt from the design (pages-a.js PAGES.min + pages.css .min/.cine-bar).
-//
-// The design's whole point here: the window snaps to the film's aspect ratio (no
-// letterbox bars), and a large rounded control pill straddles the bottom edge of
-// the picture - half on the picture, half below it. The pill is a 3-column grid
-// (230px | 1fr | 230px) at min(860px, 100% - 48px), 92px tall, radius 30.
-//
-// The window resize itself is Main.qml's job (it owns the window); this page only
-// reports the film aspect and draws the bar.
+// Minimal mode reserves a full-width transport row below the native video.
+// Main.qml owns the viewport and the independently composited control window.
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
@@ -43,8 +36,8 @@ VPage {
     }
     onEnter: { cineIn.frac = 0.12; cineInAnim.restart() }
 
-    // The independent pill extends below this window; no opaque spacer is needed.
-    readonly property real pictureHeight: parent ? parent.height : 0
+    // Keep the native picture above the reserved playback controls.
+    readonly property real pictureHeight: parent ? Math.max(0, parent.height - (parent.width < 640 ? 78 : 48)) : 0
 
     // --- the picture ------------------------------------------------------
     // .min .stage: full width, the picture height, radius 8 (the window radius),
@@ -63,8 +56,10 @@ VPage {
 
         Text {
             anchors.centerIn: parent
-            visible: stageTap.enabled
-            text: qsTr("点击画面选择片源")
+            visible: veyra.sourceKind === "browser" || stageTap.enabled
+            width: Math.max(0, parent.width - 40)
+            horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap
+            text: veyra.sourceKind === "browser" ? qsTr("画面在浏览器视频区域显示") + "\n" + veyra.browserStatus : qsTr("点击画面选择片源")
             color: Theme.t3
             font.family: Theme.fontUi
             font.pixelSize: Theme.fsH3
@@ -116,6 +111,7 @@ VPage {
         objectName: "min-source-menu"
         title: qsTr("片源")
         items: [{ label: qsTr("打开文件…"), icon: "folder", act: "file" },
+                     { label: qsTr("浏览器增强…"), icon: "globe", act: "browser" },
                 { label: qsTr("PS5 串流…"), icon: "gamepad", act: "ps5" },
                 { label: qsTr("PC 串流…"), icon: "cast", act: "moonlight" },
                 { label: qsTr("Xbox 串流…"), icon: "gamepad", act: "xbox" },
@@ -124,6 +120,7 @@ VPage {
                 { label: qsTr("采集卡设置…"), icon: "settings", act: "capture" }]
         onPicked: (i, o) => {
             if (o.act === "file") veyra.openFileDialog()
+            else if (o.act === "browser") veyra.openBrowserDialog()
             else if (o.act === "ps5") veyra.openPs5Dialog()
             else if (o.act === "moonlight") veyra.openMoonlightDialog()
             else if (o.act === "xbox") veyra.openXboxDialog()

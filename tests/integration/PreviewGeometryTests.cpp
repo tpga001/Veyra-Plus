@@ -25,17 +25,32 @@ int wmain(int argc,wchar_t** argv){
     if(ok)for(int y=0;y<32;++y)for(int x=0;x<64;++x){auto* p=f->data[0]+y*f->linesize[0]+x*4;bool right=x>=32,bottom=y>=16;p[0]=!right||bottom?255:0;p[1]=right?255:0;p[2]=bottom?255:0;p[3]=255;}
     pipeline::EnhanceGraph::FrameOutputs out;ok=ok&&graph.process(f,0,true,out,1);
     struct Sample {int x,y,r,g,b;};
-    auto test=[&](const char* name,engine::PreviewView view,int comparison,std::initializer_list<Sample> samples){
+    const float dpiScale=std::max(1.0f,float(GetDpiForWindow(window))/96.0f);
+    sink::RgbaImage lastImage;
+    auto test=[&](const char* name,engine::PreviewView view,int comparison,std::initializer_list<Sample> samples,float split=.5f){
         const bool referencesValid=out.batch.count&&out.batch.frames[out.batch.count-1].lease&&out.batch.frames[out.batch.count-1].lease->referencesValid;
-        sink::RgbaImage image;bool pass=presenter.present(ctx,ring,graph,out.videoSlot,false,referencesValid,comparison,false,.5f,{},view)&&presenter.readPresentedFrameForTest(ctx,ring,image);
+        sink::RgbaImage image;bool pass=presenter.present(ctx,ring,graph,out.videoSlot,false,referencesValid,comparison,false,split,{},view)&&presenter.readPresentedFrameForTest(ctx,ring,image);
         pass=pass&&image.width==320&&image.height==240;
         if(pass)for(auto s:samples){auto* p=image.pixels.data()+(s.y*image.width+s.x)*4;pass=pass&&std::abs(int(p[0])-s.r)<=2&&std::abs(int(p[1])-s.g)<=2&&std::abs(int(p[2])-s.b)<=2;}
         if(pass)pass=sink::saveImage((dir/(std::string(name)+".png")).wstring(),image);
+        if(pass)lastImage=std::move(image);
         std::cout<<"PREVIEW_GEOMETRY "<<name<<" pass="<<pass<<std::endl;return pass;
     };
     if(ok)ok=test("fit",{},0,{{160,10,0,0,0},{40,80,255,0,0},{280,80,0,255,0},{40,160,255,0,255},{280,160,255,255,255}});
+    const auto fitPixels=lastImage.pixels;
+    if(ok)ok=test("compare-fit",{},2,{{160,10,0,0,0},{160,230,0,0,0},
+        {160,80,255,255,255},{160+int(1.5f*dpiScale),80,0,0,0},
+        {160+int(6*dpiScale),120,255,255,255},{160+int(3*dpiScale),120,0,0,0},
+        {40,80,255,0,0},{280,160,255,255,255}});
+    if(ok)ok=test("compare-original-baseline",{},1,{{40,80,255,0,0},{280,80,0,255,0}});
+    const auto originalFitPixels=lastImage.pixels;
+    if(ok)ok=test("compare-endpoint-enhanced",{},2,{},0)&&lastImage.pixels==fitPixels;
+    if(ok)ok=test("compare-endpoint-original",{},2,{},1)&&lastImage.pixels==originalFitPixels;
     if(ok)ok=test("zoom",{2,.5f,.5f},0,{{40,10,255,0,0},{280,10,0,255,0},{40,230,255,0,255}});
     if(ok)ok=test("pan",{2,.25f,.5f},0,{{280,60,255,0,0},{280,200,255,0,255}});
+    if(ok)ok=test("compare-pan-zoom",{2,.4f,.5f},2,{{224,80,255,255,255},
+        {224+int(1.5f*dpiScale),80,0,0,0},{224+int(6*dpiScale),120,255,255,255},
+        {40,10,255,0,0},{280,10,0,255,0}});
     if(ok)ok=test("reference",{2,.5f,.5f},1,{{40,10,255,0,0},{280,10,0,255,0}});
     if(ok)ok=test("reset",{},0,{{160,10,0,0,0},{280,80,0,255,0}});
     if(ok)ok=test("dar-4-3",{1,.5f,.5f,0,4.0/3},0,{{40,10,255,0,0},{280,10,0,255,0},{40,230,255,0,255}});
@@ -46,6 +61,10 @@ int wmain(int argc,wchar_t** argv){
         SetPropW(window,L"Veyra.ResizeDeferUntil",reinterpret_cast<HANDLE>(uintptr_t(GetTickCount64()+60000)));
         SetWindowPos(window,nullptr,0,0,400,400,SWP_NOMOVE|SWP_NOZORDER);
         ok=test("retained-square-client",{},0,{{160,40,0,0,0},{40,80,255,0,0},{280,80,0,255,0},{40,160,255,0,255},{160,200,0,0,0}});
+        if(ok)ok=test("retained-compare-square-client",{},2,{{160,40,0,0,0},{160,200,0,0,0},
+            {160,90,255,255,255},{160+int(1.5f*dpiScale*.8f),90,0,0,0},
+            {160+int(6*dpiScale*.8f),120,255,255,255},{160+int(3*dpiScale*.8f),120,0,0,0},
+            {40,80,255,0,0},{280,160,255,255,255}});
         if(ok)ok=test("retained-zoom",{2,.5f,.5f},0,{{40,10,255,0,0},{280,10,0,255,0},{40,230,255,0,255}});
         SetWindowPos(window,nullptr,0,0,320,240,SWP_NOMOVE|SWP_NOZORDER);
         RemovePropW(window,L"Veyra.ResizeDeferUntil");
@@ -54,6 +73,8 @@ int wmain(int argc,wchar_t** argv){
         for(int y=0;y<32;++y)for(int x=0;x<64;++x){auto* p=f->data[0]+y*f->linesize[0]+x*4;p[0]=0;p[1]=0;p[2]=255;p[3]=255;}
         pipeline::EnhanceGraph::FrameOutputs current;ok=graph.process(f,33.333,false,current,2,nullptr,nullptr,false);
         if(ok){out=std::move(current);ok=test("invalid-reference",{},1,{{40,80,0,0,255},{280,160,0,0,255}});}
+        if(ok)ok=test("invalid-reference-no-divider",{},2,{{160,80,0,0,255},
+            {160+int(6*dpiScale),120,0,0,255},{40,80,0,0,255},{280,160,0,0,255}});
     }
     ring.drainQueue();out={};presenter.close();graph.shutdown();av_frame_free(&f);ring.shutdown();ctx.shutdown();DestroyWindow(window);CoUninitialize();return ok?0:1;
 }

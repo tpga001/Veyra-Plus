@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "Veyra 浏览器视频增强",
+  "description": "自动识别当前前台网页的主视频，由 Veyra 在视频区域内增强。",
+  "version": "0.2.3",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "action": {
+    "default_title": "Veyra 视频增强",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "video-geometry.js",
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAu5uyAKe0MgGp1raqwD2fW2bRiNQg8Q8D5zpF6DaHkUWsVpIoLZor0oBsuXIQ5hh3Z2eCg6l08E4VWI5HlPsd2hv1+CGsrGtSlCU+6JkUEeJB3yJK2xQKDrsuuFYFrbt0yeRGPUrAY9AMKbYMxTMdEcqhu/LMv6m+NKxX0ZqlHMvp3cRRtsSXCvXP0n9ey44s5qTNwDUVhQHCLaWUwaOlGJFUZISsHnYgfheL7r3DL+FNZFUYLXLgGmeWESTxFBPXmxZuwWClQkHnWWnwD7/vQEnf5rd4SVuQBDE1ubrc84c0kx5Mh/yUSrAydThUHN1JY2IncRCAktmQSmMOFI4XgQIDAQAB"
+}

@@ -12,6 +12,11 @@ import QtQuick.Effects
 
 Rectangle {
     id: bar
+    objectName: "cineBar"
+    // Very small logical screens keep every button rather than clipping the
+    // transport. Normal 720-DIP-and-wider bars retain their existing sizes.
+    readonly property real controlsScale: Math.min(1, Math.max(0.01, width / 720))
+    readonly property bool browserSource: veyra.sourceKind === "browser"
     signal requestPage(string page)
     // Opens one of the main window's dialogs (字幕设置 / 音频设置).
     signal requestDialog(string key)
@@ -26,6 +31,14 @@ Rectangle {
     property real menuBottomLimit: -1
     // Any popover needs the owner window's full mask, not just the preset menu.
     readonly property bool menuOpen: presetMenu.visible || ccMenu.visible || audioMenu.visible || loadMenu.visible || playbackRate.menuOpen
+    function closeMenus() {
+        if (presetMenu) presetMenu.close()
+        if (ccMenu) ccMenu.close()
+        if (audioMenu) audioMenu.close()
+        if (loadMenu) loadMenu.close()
+        if (playbackRate) playbackRate.closeMenus()
+    }
+    onVisibleChanged: if (!visible) closeMenus()
     // The pointer is over the pill.
     readonly property bool hovered: barHover.hovered
     readonly property bool seekPreviewOpen: seekMouse.containsMouse && seekMouse.enabled
@@ -49,20 +62,26 @@ Rectangle {
     border.color: Qt.rgba(1, 1, 1, 0.1)
 
     RowLayout {
-        anchors.fill: parent
-        anchors.leftMargin: 16
-        anchors.rightMargin: 16
-        spacing: 18
+        id: controlsLayout
+        objectName: "cine-controls"
+        x: 16 * bar.controlsScale
+        width: bar.width / bar.controlsScale - 32
+        height: bar.height / bar.controlsScale
+        scale: bar.controlsScale
+        transformOrigin: Item.TopLeft
+        spacing: 12
 
-        // --- left: artwork + title (230px) ---------------------------
+        // The title gives space to controls first and elides long filenames.
         RowLayout {
-            Layout.preferredWidth: 230; Layout.minimumWidth: 230; Layout.maximumWidth: 230
+            objectName: "cine-title"
+            Layout.preferredWidth: 230; Layout.minimumWidth: 96; Layout.maximumWidth: 230
             Layout.fillHeight: true
             spacing: 10
             // The file's own cover art when it carries one (MP4 covr, MKV image
             // attachment); otherwise the plate stays black - never a stand-in.
             Rectangle {
                 id: coverPlate
+                visible: bar.width >= 800
                 implicitWidth: 46; implicitHeight: 46; radius: 12
                 color: Theme.videoBlack
                 border.width: 1
@@ -118,7 +137,9 @@ Rectangle {
 
         // --- middle: transport + seek --------------------------------
         ColumnLayout {
+            objectName: "cine-transport"
             Layout.fillWidth: true
+            Layout.minimumWidth: bar.browserSource ? 100 : 304
             Layout.alignment: Qt.AlignVCenter
             spacing: 4
 
@@ -157,11 +178,13 @@ Rectangle {
 
                 // 载入 (field request 2026-10-02): the home page's sources without leaving 极简.
                 CBtn { objectName: "cine-load"; glyph: "folder"; tip: qsTr("载入片源"); onTapped: loadMenu.openAt(this, "up") }
-                CBtn { glyph: "cc"; onTapped: ccMenu.openAt(this, "up") }
-                CBtn { glyph: "back10"; onTapped: veyra.seekBy(-10) }
+                CBtn { objectName: "cine-subtitles"; visible: !bar.browserSource; glyph: "cc"; onTapped: ccMenu.openAt(this, "up") }
+                CBtn { visible: !bar.browserSource; glyph: "back10"; onTapped: veyra.seekBy(-10) }
 
                 // .play: 40px white circle with the play/pause glyph.
                 Item {
+                    objectName: "cine-play-pause"
+                    visible: !bar.browserSource
                     implicitWidth: 40
                     implicitHeight: 40
                     Rectangle {
@@ -181,13 +204,21 @@ Rectangle {
                     TapHandler { id: playTap; gesturePolicy: TapHandler.WithinBounds; onTapped: veyra.togglePlayPause() }
                 }
 
-                CBtn { glyph: "fwd10"; onTapped: veyra.seekBy(10) }
-                CBtn { glyph: "music"; onTapped: audioMenu.openAt(this, "up") }
-                PlaybackRateButton { id: playbackRate; objectName: "cine-playback-rate"; menuBottomLimit: bar.menuBottomLimit }
+                CBtn { visible: !bar.browserSource; glyph: "fwd10"; onTapped: veyra.seekBy(10) }
+                CBtn { visible: !bar.browserSource; glyph: "music"; onTapped: audioMenu.openAt(this, "up") }
+                PlaybackRateButton { visible: !bar.browserSource; id: playbackRate; objectName: "cine-playback-rate"; menuBottomLimit: bar.menuBottomLimit }
             }
 
+            Text {
+                objectName: "cine-browser-status"
+                visible: bar.browserSource; Layout.fillWidth: true
+                text: veyra.browserTelemetry.live ? qsTr("浏览器 · 实时监控") : veyra.browserTelemetry.hasLastSample ? qsTr("浏览器 · 已冻结") : qsTr("浏览器 · 等待视频")
+                color: Theme.t3; font.family: Theme.fontUi; font.pixelSize: 11; elide: Text.ElideRight
+                horizontalAlignment: Text.AlignHCenter
+            }
             // .seekrow: mono times either side of the rail.
             RowLayout {
+                visible: !bar.browserSource
                 Layout.fillWidth: true
                 spacing: 10
                 Text {
@@ -366,17 +397,44 @@ Rectangle {
 
             // .pill with a status dot: the dot reports the engine's state, and
             // the label is the preset actually in use.
-            VPill {
-                key: ""
-                value: veyra.currentPresetName
-                onClicked: presetMenu.openAt(this, "up")
-                Rectangle {
-                    width: 7; height: 7; radius: 3.5
-                    color: veyra.failed ? Theme.err : veyra.captureRecovering ? Theme.warn : Theme.ok
+            // Bound only the label, never the following volume/fullscreen/hide
+            // buttons. VPill's natural text width used to push them off the window.
+            Rectangle {
+                id: presetButton
+                objectName: "cine-preset"
+                Layout.fillWidth: true
+                Layout.minimumWidth: 60
+                implicitHeight: Theme.ctlHeight
+                radius: 999
+                color: presetHover.hovered ? Qt.rgba(1, 1, 1, 0.10) : Qt.rgba(1, 1, 1, 0.05)
+                border.width: 1; border.color: Theme.stroke2
+                RowLayout {
+                    anchors.fill: parent
+                    anchors.leftMargin: 10; anchors.rightMargin: 10
+                    spacing: 7
+                    Rectangle {
+                        width: 7; height: 7; radius: 3.5
+                        color: bar.browserSource ? (veyra.browserTelemetry.live ? Theme.ok : veyra.browserTelemetry.hasLastSample ? Theme.warn : Theme.t3)
+                             : veyra.failed ? Theme.err : veyra.captureRecovering ? Theme.warn : Theme.ok
+                    }
+                    Text {
+                        objectName: "cine-preset-label"
+                        Layout.fillWidth: true
+                        text: veyra.currentPresetName
+                        color: Theme.t1; font.family: Theme.fontUi
+                        font.pixelSize: Theme.fsBody; font.weight: Font.Medium
+                        elide: Text.ElideRight
+                    }
                 }
+                HoverHandler { id: presetHover; cursorShape: Qt.PointingHandCursor }
+                TapHandler { onTapped: presetMenu.openAt(presetButton, "up") }
+                ToolTip.visible: presetHover.hovered && !presetMenu.visible
+                ToolTip.text: veyra.currentPresetName
             }
 
             Item {
+                objectName: "cine-volume"
+                visible: !bar.browserSource
                 implicitWidth: 80
                 implicitHeight: 20
                 RowLayout {
@@ -392,6 +450,8 @@ Rectangle {
             }
 
             Item {
+                objectName: "cine-fullscreen"
+                visible: !bar.browserSource
                 implicitWidth: 32; implicitHeight: 32
                 VIcon {
                     anchors.centerIn: parent
@@ -421,6 +481,8 @@ Rectangle {
     // pages-a.js presetMenu: list presets, node presets, then the way to manage them.
     VMenu {
         id: presetMenu
+        objectName: "cine-preset-menu"
+        height: bar.menuBottomLimit >= 0 ? Math.min(implicitHeight, Math.max(72, bar.menuBottomLimit - 8)) : implicitHeight
         aboveLimit: bar.menuBottomLimit
         title: qsTr("预设")
         readonly property var mk: p => ({ label: p.name, note: p.note, checked: p.name === veyra.currentPresetName,
@@ -439,16 +501,20 @@ Rectangle {
     // one checked, then loading a file and the settings dialog.
     VMenu {
         id: ccMenu
+        objectName: "cine-subtitle-menu"
+        height: bar.menuBottomLimit >= 0 ? Math.min(implicitHeight, Math.max(72, bar.menuBottomLimit - 8)) : implicitHeight
         aboveLimit: bar.menuBottomLimit
         title: qsTr("字幕")
         items: [{ label: qsTr("关闭", "off"), checked: veyra.subtitlePrimary < 0, track: -1 }]
             .concat(veyra.subtitleTracks.map(t => ({ label: t.label, note: t.note, track: t.index,
                                                      disabled: !t.usable, checked: t.index === veyra.subtitlePrimary })))
-            .concat([{ label: qsTr("加载外部字幕…"), icon: "import", act: "load" },
+            .concat([{ label: qsTr("在线字幕…"), icon: "globe", act: "online", disabled: !veyra.onlineSubtitles.available },
+                     { label: qsTr("加载外部字幕…"), icon: "import", act: "load" },
                      { sep: true },
                      { label: qsTr("字幕设置…"), note: qsTr("字体、字号、描边、位置、延时"), icon: "type", act: "dlg" }])
         onPicked: (i, o) => {
-            if (o.act === "load") veyra.loadSubtitleDialog()
+            if (o.act === "online") bar.requestDialog("online-subtitle")
+            else if (o.act === "load") veyra.loadSubtitleDialog()
             else if (o.act === "dlg") bar.requestDialog("subtitle")
             else if (o.track !== undefined) veyra.subtitlePrimary = o.track
         }
@@ -458,11 +524,13 @@ Rectangle {
     // (or the file picker) in the main window; the pill steps aside while one is open.
     VMenu {
         id: loadMenu
+        height: bar.menuBottomLimit >= 0 ? Math.min(implicitHeight, Math.max(72, bar.menuBottomLimit - 8)) : implicitHeight
         objectName: "cine-load-menu"
         aboveLimit: bar.menuBottomLimit
         title: qsTr("载入片源")
         items: [
             { label: qsTr("打开视频"), note: qsTr("MP4 · MKV · 图片"), icon: "folder", act: "file" },
+            { label: qsTr("浏览器增强"), note: qsTr("Chrome · Edge 视频"), icon: "globe", act: "browser" },
             { label: qsTr("采集卡"), note: qsTr("HDMI 采集设备"), icon: "video", act: "capture" },
             { label: qsTr("PS5 串流"), note: qsTr("局域网串流"), icon: "gamepad", act: "ps5" },
             { label: qsTr("PC 串流"), note: qsTr("Sunshine 主机"), icon: "cast", act: "moonlight" },
@@ -472,6 +540,7 @@ Rectangle {
         onPicked: (i, o) => {
             switch (o.act) {
             case "file": veyra.openFileDialog(); break
+            case "browser": veyra.openBrowserDialog(); break
             case "capture": veyra.openCaptureDialog(); break
             case "ps5": veyra.openPs5Dialog(); break
             case "moonlight": veyra.openMoonlightDialog(); break
@@ -485,6 +554,8 @@ Rectangle {
     // selected index, so the list and the check mark both come from the engine.
     VMenu {
         id: audioMenu
+        objectName: "cine-audio-menu"
+        height: bar.menuBottomLimit >= 0 ? Math.min(implicitHeight, Math.max(72, bar.menuBottomLimit - 8)) : implicitHeight
         aboveLimit: bar.menuBottomLimit
         title: qsTr("音轨")
         // The bridge's label already carries language · title · codec; only the

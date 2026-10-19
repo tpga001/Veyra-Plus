@@ -1,4 +1,5 @@
 #include "veyra/gfx/PresentSink.h"
+#include "veyra/NativePaintDiagnostics.h"
 #include "veyra/gfx/PresentationHooks.h"
 
 #include <windows.h>
@@ -161,7 +162,8 @@ bool PresentSink::initialize(ID3D12Device* device, ID3D12CommandQueue* queue,
     presentContractDirty_=true;
     width_ = desc.width;
     height_ = desc.height;
-    if (!device_ || !queue_ || (desc.targetWindow && !IsWindow(desc.targetWindow))) {
+    if ((desc.previewOnly && (!desc.targetWindow || desc.xess || desc.hdr || desc.hdr10 || desc.vsync)) ||
+        !device_ || !queue_ || (desc.targetWindow && !IsWindow(desc.targetWindow))) {
         log::warn("present", "sink initialization refused invalid device, queue or target window");
         status = Status::WindowFailure;
         return false;
@@ -199,7 +201,14 @@ bool PresentSink::initialize(ID3D12Device* device, ID3D12CommandQueue* queue,
         return false;
     }
     if (!desc.targetWindow) ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
-    UpdateWindow(hwnd_);
+    // Preview HWND paint belongs to the GUI. A worker UpdateWindow sends a
+    // synchronous WM_PAINT and can deadlock against GUI shutdown()/join.
+    if(!desc.previewOnly) {
+        diagnostics::NativePaintScope updateScope(
+            diagnostics::syncWindowUpdate, reinterpret_cast<std::uintptr_t>(hwnd_),
+            static_cast<std::uint32_t>(GetCurrentThreadId()));
+        UpdateWindow(hwnd_);
+    }
 
     // Factory with tearing awareness.
     UINT factoryFlags = 0;
@@ -263,7 +272,7 @@ bool PresentSink::initialize(ID3D12Device* device, ID3D12CommandQueue* queue,
         // E_ACCESSDENIED: the window still has the previous swapchain. That is normally gone
         // within a frame or two, but an overlay that hooks presentation (GamePP in the field
         // log 2026-10-01) can hold it longer; wait up to ~1.3 s before failing the rebuild.
-        constexpr unsigned attempts=8;
+        const unsigned attempts=desc.previewOnly?1u:8u;
         for(unsigned attempt=0;attempt<attempts;++attempt){
             swapChain1.Reset();
             result=factory_->CreateSwapChainForHwnd(queue,hwnd_,&scd,nullptr,nullptr,&swapChain1);
@@ -296,7 +305,7 @@ bool PresentSink::initialize(ID3D12Device* device, ID3D12CommandQueue* queue,
     if(FAILED(check)||!(support&DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)||FAILED(swapChain_->SetColorSpace1(space))){log::error("present","Requested output color space is unavailable");status=Status::WindowFailure;return false;}
     log::info("present",desc.hdr10?"output=HDR10 RGB10 PQ/BT2020":desc.hdr?"output=scRGB FP16 (1=80 nits)":"output=SDR RGB G22");
     // Block ALT+ENTER; the engine owns mode changes.
-    (void)factory_->MakeWindowAssociation(hwnd_, DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER);
+    if(!desc.previewOnly)(void)factory_->MakeWindowAssociation(hwnd_, DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER);
     if (!refetchBackBuffers()) {
         status = Status::WindowFailure;
         return false;
@@ -340,6 +349,7 @@ bool PresentSink::refetchBackBuffers()
         }
     }
     backBufferIndex_ = swapChain_->GetCurrentBackBufferIndex();
+    ++outputGeneration_;
     return true;
 }
 
@@ -452,6 +462,27 @@ bool PresentSink::present(Status& status)
     }
     status = Status::WindowFailure;
     return false;
+}
+
+PresentSink::PreviewPresentResult PresentSink::tryPresentPreview(Status& status){
+    if(!desc_.previewOnly||xess_||!swapChain_||desc_.vsync){status=Status::WindowFailure;return PreviewPresentResult::Unavailable;}
+    if(!capacityAcquired_)return PreviewPresentResult::Busy;
+    capacityAcquired_=false;
+    const UINT flags=DXGI_PRESENT_DO_NOT_WAIT|((desc_.tearing&&tearingSupported_)?DXGI_PRESENT_ALLOW_TEARING:0);
+    ++attemptedPresentCount_;
+    const HRESULT hr=swapChain_->Present(0,flags);
+    presentTiming_={};presentTiming_.result=hr;
+    if(hr==DXGI_ERROR_WAS_STILL_DRAWING)return PreviewPresentResult::Busy;
+    if(hr==DXGI_STATUS_OCCLUDED)return PreviewPresentResult::Occluded;
+    if(SUCCEEDED(hr)){
+        ++presentCount_;backBufferIndex_=swapChain_->GetCurrentBackBufferIndex();
+        return PreviewPresentResult::Presented;
+    }
+    ++failedPresentCount_;
+    const HRESULT removed=device_?device_->GetDeviceRemovedReason():S_OK;
+    status=(hr==DXGI_ERROR_DEVICE_REMOVED||hr==DXGI_ERROR_DEVICE_RESET||removed!=S_OK)?Status::DeviceFailure:Status::WindowFailure;
+    log::warn("browser-preview-present",std::format("nonblocking Present hr=0x{:X} removed=0x{:X} primaryUnaffected=1",unsigned(hr),unsigned(removed)));
+    return PreviewPresentResult::Failed;
 }
 
 PresentSink::FrameStatisticsDelta PresentSink::sampleFrameStatistics(){

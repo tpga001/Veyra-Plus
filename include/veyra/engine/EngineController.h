@@ -12,6 +12,7 @@
 #include "veyra/engine/PresentationSettings.h"
 #include "veyra/diagnostics/FrameMetrics.h"
 #include "veyra/engine/PreviewView.h"
+#include "veyra/engine/BrowserPreviewTypes.h"
 #include "veyra/sink/CaptureAudioSession.h"
 #include "veyra/remoteplay/SessionInbox.h"
 #ifdef VEYRA_ENABLE_MOONLIGHT
@@ -47,6 +48,7 @@ struct PlayerOptions { bool nr=false,sr=false,fg=false,realtime=true; uint32_t f
 };
 enum class TransportState { Empty, Opening, Playing, Paused, Ended, Stopping, Failed };
 struct PlayerSnapshot {
+    BrowserPreviewSnapshot browserPreview;
     PresentationSettings presentation, presentationEffective;
     // XeSS/FSR owns Present; the UI greys the pacing controls when true.
     bool presentationProviderOwned=false;
@@ -65,9 +67,14 @@ struct PlayerSnapshot {
     std::wstring status=L"请打开视频或图片";
     EnhancementSettings desired,applied;bool applying=false;
     bool nrActive=false,srActive=false,fgActive=false;
+    uint64_t outputSwapchainAddress=0,outputGeneration=0; // primary video output identity, never the Qt UI/preview
+    pipeline::Extent videoSrInputExtent{}; // actual executing RTX input, not capture/display extent
     bool nrAutoActive=false;
     uint32_t nrAutoPercent=0,nrAutoWidth=0,nrAutoHeight=0;
     std::wstring nrAutoStatus;
+    bool beautyActive=false;
+    uint64_t beautyEvaluated=0;
+    std::wstring beautyStatus=L"美颜已关闭";
     bool videoHdrActive=false; // TrueHDR actually running this graph (needs an HDR display path)
     std::wstring backendWarning;
     std::wstring sourceNotice;
@@ -146,6 +153,9 @@ class EngineController {
 public:
     EngineController();
     ~EngineController();
+    // GUI teardown only, after app.exec(): joins before borrowed HWND destruction.
+    void shutdown();
+    void requestBrowserPreview(BrowserPreviewRequest);
     bool idle()const;
     bool prewarmEnhancement(EnhancementSettings,unsigned width=1920,unsigned height=1080);
     void setEnhancementPrewarmEnabled(bool);
@@ -195,6 +205,8 @@ private:
     void dispatch();
     void status(const std::wstring&,bool failed=false);
     mutable std::mutex mutex_;
+    std::once_flag shutdownOnce_;
+    BrowserPreviewRequest browserPreviewRequest_;
     PlayerSnapshot snapshot_;
     PresentationSettings presentation_;
     uint64_t presentationRevision_=1;

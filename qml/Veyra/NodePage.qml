@@ -16,6 +16,30 @@ import QtQuick.Shapes
 
 VPage {
     id: root
+    readonly property bool browserSource: veyra.sourceKind === "browser"
+    readonly property var browserInfo: veyra.browserTelemetry || ({})
+    readonly property var browserPreviewInfo: veyra.browserPreview || ({})
+    readonly property string browserReferenceText: {
+        if (!browserPreviewInfo.hasFrame)
+            return veyra.browserPreviewComparisonMode !== 0 ? qsTr("等待同帧对照") : qsTr("等待增强预览")
+        if (browserPreviewInfo.comparisonPending) {
+            if (veyra.browserPreviewComparisonMode !== 0 && !browserPreviewInfo.referenceAvailable)
+                return qsTr("原图未就绪，暂显示增强画面")
+            return qsTr("切换中，暂显示上一画面")
+        }
+        return browserPreviewInfo.comparisonMode === 2 ? qsTr("左侧增强前 · 右侧增强后")
+             : browserPreviewInfo.comparisonMode === 1 ? qsTr("显示增强前")
+             : qsTr("显示增强后")
+    }
+    readonly property rect browserPreviewRect: {
+        if (!browserSource || !current || !visible || !shell || !videoArea.visible)
+            return Qt.rect(0, 0, 0, 0)
+        const p = videoArea.mapToItem(shell.contentItem, 0, 0)
+        return Qt.rect(p.x, p.y, videoArea.width, videoArea.height)
+    }
+    readonly property string browserSampleText: browserInfo.live ? qsTr("播放中 · 实时")
+        : browserInfo.hasLastSample ? qsTr("已冻结") + (browserInfo.sampleAgeMs >= 0 ? " · " + (browserInfo.sampleAgeMs / 1000).toFixed(1) + qsTr(" 秒前") : "")
+        : qsTr("等待视频")
     signal requestPage(string page)
     signal requestDialog(string key)
     signal requestInspector(int nodeIndex, string nodeType)
@@ -68,6 +92,7 @@ VPage {
         case "sr": return "#4F7BFF"
         case "nr": return "#FF8A3D"
         case "protection": return "#8A8A96"
+        case "beauty": return "#E4A2B4"
         case "video-hdr": return "#FFB547"
         case "frame-generation": case "dlss-fg": case "xess-fg": case "fsr3-fg": case "fsr4-fg": case "vfg-fg": return "#3DDC84"
         }
@@ -100,7 +125,7 @@ VPage {
         for (const id of ids) {
             const n = veyra.chain.find(x => x.id === id)
             if (!n) continue
-            if (n.mustBeLast) { ++pinned; continue }
+            if (n.mustBeLast || n.fixedOrder) { ++pinned; continue }
             if (veyra.nodeIndexForId(id) >= 0) { root.removeNodeAnimated(id); ++removed }
         }
         clearSelection()
@@ -242,6 +267,7 @@ VPage {
     }
     // Take a wired node out of the path and join its neighbours (design detach()).
     function detach(id, nudge) {
+        if (veyra.chain.find(n => n.id === id)?.fixedOrder === true) return
         const edges = veyra.nodeConnections
         const prev = edges.find(e => e.to === id), next = edges.find(e => e.from === id)
         if (!prev && !next) return
@@ -357,8 +383,13 @@ VPage {
                 anchors.bottom: statsBar.top
                 Text {
                     anchors.centerIn: parent
-                    visible: !veyra.hasSource
-                    text: veyra.statusText
+                    visible: root.browserSource ? !root.browserPreviewInfo.hasFrame : !veyra.hasSource
+                    width: Math.max(0, parent.width - 40)
+                    horizontalAlignment: Text.AlignHCenter
+                    wrapMode: Text.WordWrap
+                    text: root.browserSource ? (root.browserInfo.live
+                        ? (root.browserPreviewInfo.status || qsTr("等待增强预览"))
+                        : (root.browserInfo.status || veyra.browserStatus)) : veyra.statusText
                     color: Theme.t3
                     font.family: Theme.fontUi
                     font.pixelSize: Theme.fsH3
@@ -368,74 +399,120 @@ VPage {
             // .nv-bar: transport, then the stats strip.
             Rectangle {
                 id: statsBar
+                readonly property bool compact: width < 1040
                 anchors.left: parent.left
                 anchors.right: parent.right
                 anchors.bottom: parent.bottom
-                height: 40
+                height: root.browserSource ? 94 : 40
                 color: Theme.card
+                RowLayout {
+                    objectName: "node-browser-compare-toolbar"
+                    visible: root.browserSource
+                    anchors.left: parent.left; anchors.right: parent.right
+                    anchors.leftMargin: 10; anchors.rightMargin: 10
+                    anchors.top: parent.top
+                    height: 36
+                    spacing: 8
+                    VSeg {
+                        objectName: "node-browser-compare-mode"
+                        options: [{ id: "0", label: qsTr("增强后") },
+                                  { id: "2", label: qsTr("左右对比") },
+                                  { id: "1", label: qsTr("增强前") }]
+                        current: String(veyra.browserPreviewComparisonMode)
+                        onPicked: id => veyra.browserPreviewComparisonMode = Number(id)
+                    }
+                    VSlider {
+                        objectName: "node-browser-compare-split"
+                        visible: veyra.browserPreviewComparisonMode === 2
+                        Layout.preferredWidth: 100; Layout.minimumWidth: 40
+                        valueFromModel: true
+                        from: 0; to: 1; inputScale: 100; inputDecimals: 0
+                        value: veyra.browserPreviewComparisonSplit
+                        onMoved: value => veyra.browserPreviewComparisonSplit = value
+                        ToolTip.visible: nodeSplitHover.hovered
+                        ToolTip.text: qsTr("分界位置；0% 全部增强后，100% 全部增强前")
+                        HoverHandler { id: nodeSplitHover }
+                    }
+                    Text {
+                        visible: veyra.browserPreviewComparisonMode === 2
+                        text: Math.round(veyra.browserPreviewComparisonSplit * 100) + "%"
+                        color: Theme.t2; font.family: Theme.fontMono; font.pixelSize: 11
+                    }
+                    Text {
+                        objectName: "browser-reference-status"
+                        Layout.fillWidth: true; Layout.minimumWidth: 0
+                        text: root.browserReferenceText
+                        color: root.browserPreviewInfo.comparisonPending ? Theme.warn : Theme.t3
+                        font.family: Theme.fontUi; font.pixelSize: 11; elide: Text.ElideRight
+                        ToolTip.visible: nodeReferenceHover.hovered
+                        ToolTip.text: root.browserReferenceText
+                        HoverHandler { id: nodeReferenceHover }
+                    }
+                }
+                Text {
+                    objectName: "node-browser-preview-caption"
+                    visible: root.browserSource
+                    anchors.left: parent.left; anchors.right: parent.right
+                    anchors.leftMargin: 10; anchors.rightMargin: 10
+                    anchors.top: parent.top; anchors.topMargin: 38
+                    text: qsTr("增强预览 · 不含 XeSS 额外补帧") + " · "
+                        + (root.browserInfo.live ? (root.browserPreviewInfo.status || qsTr("等待增强预览")) : root.browserSampleText)
+                    color: Theme.t3; font.family: Theme.fontUi; font.pixelSize: 10; elide: Text.ElideRight
+                }
 
                 RowLayout {
                     anchors.fill: parent
+                    anchors.topMargin: root.browserSource ? 54 : 0
                     anchors.leftMargin: 8
                     anchors.rightMargin: 8
-                    spacing: 8
+                    spacing: statsBar.compact ? 4 : 8
 
                     // pages-node.js .nv-bar: the source first, as on the list page.
                     VButton {
                         id: nodeSourceBtn
                         objectName: "node-source-button"
-                        iconName: veyra.sourceKind === "ps5" ? "gamepad" : veyra.sourceKind === "moonlight" ? "cast" : veyra.sourceKind === "xbox" ? "gamepad" : veyra.sourceKind === "screen" ? "monitor"
+                        iconName: root.browserSource ? "globe" : veyra.sourceKind === "ps5" ? "gamepad" : veyra.sourceKind === "moonlight" ? "cast" : veyra.sourceKind === "xbox" ? "gamepad" : veyra.sourceKind === "screen" ? "monitor"
                                 : veyra.sourceKind === "image" ? "image" : veyra.sourceKind === "file" ? "film" : "video"
                         text: veyra.sourceTitle.length > 0 ? veyra.sourceTitle : qsTr("片源")
-                        maxTextWidth: 180
+                        maxTextWidth: statsBar.compact ? 48 : 180
+                        tip: statsBar.compact ? text : ""
                         trailingIcon: "down"
                         onClicked: nodeSourceMenu.openAt(this, "down")
                     }
                     VButton {
+                        objectName: "node-play-pause"
+                        visible: !root.browserSource
                         icon: true
                         iconName: (veyra.running && !veyra.paused) ? "pause" : "play"
                         onClicked: veyra.togglePlayPause()
                     }
-                    VButton { icon: true; iconName: "back10"; onClicked: veyra.seekBy(-10) }
-                    VButton { icon: true; iconName: "fwd10"; onClicked: veyra.seekBy(10) }
+                    VButton { objectName: "node-seek-back"; visible: !root.browserSource; icon: true; iconName: "back10"; onClicked: veyra.seekBy(-10) }
+                    VButton { objectName: "node-seek-forward"; visible: !root.browserSource; icon: true; iconName: "fwd10"; onClicked: veyra.seekBy(10) }
 
-                    // .nv-stats: each entry separated by a hairline, mono numbers.
-                    RowLayout {
-                        Layout.fillWidth: true
-                        Layout.minimumWidth: 0
-                        clip: true
-                        spacing: 0
-                        Repeater {
-                            model: [
-                                { k: qsTr("输入"), v: veyra.sourceSummary, hi: false },
-                                { k: qsTr("输出"), v: veyra.outputSummary.length > 0 ? veyra.outputSummary : qsTr("未测"), hi: false },
-                                { k: qsTr("显示 fps"), v: veyra.displayFpsKnown ? veyra.displayFps.toFixed(1) : qsTr("未测"), hi: true },
-                                { k: veyra.submitFpsLabel + " fps", v: veyra.submitFpsKnown ? veyra.submitFps.toFixed(1) : qsTr("未测"), hi: false },
-                                { k: qsTr("待呈现"), v: veyra.queuedFramesKnown ? veyra.queuedFrames.toFixed(0) + qsTr(" 帧") : qsTr("未测"), hi: false }
-                            ]
-                            delegate: RowLayout {
-                                required property var modelData
-                                required property int index
-                                spacing: 5
-                                Rectangle {
-                                    implicitWidth: 1; implicitHeight: 12
-                                    color: Theme.stroke
-                                    visible: index > 0
-                                }
-                                Text {
-                                    text: modelData.k
-                                    color: Theme.t3
-                                    font.family: Theme.fontUi
-                                    font.pixelSize: 10
-                                }
-                                Text {
-                                    text: modelData.v.length > 0 ? modelData.v : "—"
-                                    color: modelData.hi && veyra.displayFpsKnown ? Theme.ok : Theme.t1
-                                    font.family: Theme.fontMono
-                                    font.pixelSize: modelData.hi ? 14 : 12
-                                    font.weight: Font.DemiBold; font.variableAxes: Theme.axesDemiBold
-                                }
-                            }
+                    VTag {
+                        objectName: "node-browser-status"
+                        visible: root.browserSource
+                        text: root.browserSampleText
+                        kind: root.browserInfo.live ? "ok" : "warn"
+                        ToolTip.visible: browserStatusHover.hovered
+                        ToolTip.text: (root.browserInfo.status || veyra.browserStatus)
+                            + (!root.browserInfo.live && root.browserInfo.hasLastSample && root.browserInfo.sampleAgeMs >= 0 ? "\n" + (root.browserInfo.sampleAgeMs / 1000).toFixed(1) + qsTr(" 秒前的采样") : "")
+                        HoverHandler { id: browserStatusHover }
+                    }
+
+                    // Display status and counters share one measured output stream.
+                    ColumnLayout {
+                        objectName: "node-output-column"
+                        Layout.fillWidth: true; Layout.minimumWidth: 0; spacing: 4
+                        Text {
+                            Layout.fillWidth: true
+                            text: veyra.sourceSummary + " → " + (veyra.outputSummary || qsTr("等待输出"))
+                            elide: Text.ElideRight; color: Theme.t1; font.family: Theme.fontUi; font.pixelSize: 11
+                        }
+                        Text {
+                            Layout.fillWidth: true
+                            text: qsTr("实时帧率与 1% low 见副屏性能监测")
+                            elide: Text.ElideRight; color: Theme.t3; font.family: Theme.fontUi; font.pixelSize: 10
                         }
                     }
 
@@ -443,6 +520,7 @@ VPage {
                     ProPage.PerfOrbs { objectName: "node-perf-orbs"; size: 32; showLabels: false; spacing: 6 }
                     VButton {
                         objectName: "node-fullscreen"
+                        visible: !root.browserSource
                         icon: true; iconName: "max"
                         tip: qsTr("全屏画面（双击画面 / F11）")
                         onClicked: root.requestFullscreen()
@@ -450,8 +528,12 @@ VPage {
                     // .viewtog: 列表 asks first (the list configuration comes back).
                     VSeg {
                         objectName: "node-mode-switch"
-                        options: [{ id: "list", label: qsTr("列表"), icon: "list" }, { id: "node", label: qsTr("节点"), icon: "nodes" }]
+                        options: [{ id: "list", label: statsBar.compact ? "" : qsTr("\u5217\u8868"), icon: "list" },
+                                  { id: "node", label: statsBar.compact ? "" : qsTr("\u8282\u70b9"), icon: "nodes" }]
                         current: "node"
+                        ToolTip.visible: statsBar.compact && nodeModeHover.hovered
+                        ToolTip.text: qsTr("\u5217\u8868 / \u8282\u70b9")
+                        HoverHandler { id: nodeModeHover }
                         onPicked: id => { if (id === "list") returnDialog.open() }
                     }
                     VButton { objectName: "node-return-list"; visible: false; text: qsTr("返回列表"); onClicked: returnDialog.open() }
@@ -461,7 +543,8 @@ VPage {
                         iconName: "nodes"
                         trailingIcon: "down"
                         maxTextWidth: 150
-                        text: qsTr("节点预设：") + veyra.currentPresetName
+                        text: statsBar.compact ? "" : qsTr("\u8282\u70b9\u9884\u8bbe\uff1a") + veyra.currentPresetName
+                        tip: statsBar.compact ? qsTr("\u8282\u70b9\u9884\u8bbe\uff1a") + veyra.currentPresetName : ""
                         onClicked: nodePresetMenu.openAt(this, "down")
                     }
                 }
@@ -598,7 +681,7 @@ VPage {
                         Text { text: qsTr("输入 · 光流"); color: Theme.t1; font.family: Theme.fontUi; font.pixelSize: Theme.fsBody; font.weight: Font.Medium }
                         Text {
                             Layout.fillWidth: true
-                            text: veyra.sourceSummary.length > 0 ? veyra.sourceSummary : qsTr("未打开片源")
+                            text: root.browserSource ? veyra.sourceFormatText : veyra.sourceSummary.length > 0 ? veyra.sourceSummary : qsTr("未打开片源")
                             color: Theme.t3; font.family: Theme.fontMono; font.pixelSize: 10; elide: Text.ElideRight
                         }
                         VSelect {
@@ -666,13 +749,14 @@ VPage {
                         id: outCol
                         anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
                         anchors.margins: 10; spacing: 6
-                        Text { text: qsTr("输出 · 声音"); color: Theme.t1; font.family: Theme.fontUi; font.pixelSize: Theme.fsBody; font.weight: Font.Medium }
+                        Text { text: root.browserSource ? qsTr("输出 · 显示") : qsTr("输出 · 声音"); color: Theme.t1; font.family: Theme.fontUi; font.pixelSize: Theme.fsBody; font.weight: Font.Medium }
                         Text {
                             Layout.fillWidth: true
                             text: veyra.outputSummary.length > 0 ? veyra.outputSummary : qsTr("未输出")
                             color: Theme.t3; font.family: Theme.fontMono; font.pixelSize: 10; elide: Text.ElideRight
                         }
                         RowLayout {
+                            visible: !root.browserSource
                             Layout.fillWidth: true; spacing: 6
                             VIcon { name: "vol"; size: 14; color: Theme.t2 }
                             VSlider {
@@ -687,6 +771,7 @@ VPage {
                         }
                         VSeg {
                             objectName: "node-out-sync"
+                            visible: !root.browserSource
                             Layout.fillWidth: true
                             options: [{ id: "0", label: qsTr("自动估算") }, { id: "1", label: qsTr("手动") }, { id: "2", label: qsTr("关闭", "off") }]
                             current: String(veyra.audioSyncMode)
@@ -694,7 +779,7 @@ VPage {
                         }
                         RowLayout {
                             Layout.fillWidth: true; spacing: 6
-                            visible: veyra.audioSyncMode === 1
+                            visible: !root.browserSource && veyra.audioSyncMode === 1
                             Text { text: qsTr("偏移"); color: Theme.t3; font.family: Theme.fontUi; font.pixelSize: 10 }
                             VSlider {
                                 id: nodeOffset
@@ -707,8 +792,14 @@ VPage {
                         }
                         Text {
                             Layout.fillWidth: true
-                            visible: veyra.audioSyncMode === 0
+                            visible: !root.browserSource && veyra.audioSyncMode === 0
                             text: veyra.audioSyncLive ? qsTr("软件估算补偿 ") + veyra.audioCompensationMs.toFixed(0) + " ms" : qsTr("自动估算：采集卡 / PS5 实时输入时生效")
+                            color: Theme.t3; font.family: Theme.fontUi; font.pixelSize: 10; wrapMode: Text.WordWrap
+                        }
+                        Text {
+                            visible: root.browserSource
+                            Layout.fillWidth: true
+                            text: qsTr("声音与播放由浏览器控制")
                             color: Theme.t3; font.family: Theme.fontUi; font.pixelSize: 10; wrapMode: Text.WordWrap
                         }
                         // 显示同步 / 输出上限: presentation belongs to the output.
@@ -745,9 +836,10 @@ VPage {
                                 }
                             }
                         }
-                        NodeLabel { text: qsTr("输出设备") }
+                        NodeLabel { visible: !root.browserSource; text: qsTr("输出设备") }
                         VSelect {
                             objectName: "node-out-device"
+                            visible: !root.browserSource
                             Layout.fillWidth: true
                             title: qsTr("输出设备")
                             readonly property string chosen: veyra.preferences.audioDevice || ""
@@ -1097,7 +1189,7 @@ VPage {
         property bool willDetach: false
         objectName: "node-card-" + node.index
         readonly property var nr: veyra.nrLayers.find(layer => layer.index === node.index) || null
-        readonly property bool locked: node.mustBeLast === true
+        readonly property bool locked: node.mustBeLast === true || node.fixedOrder === true
         readonly property bool linked: veyra.nodeConnections.some(e => e.to === node.id)
 
         x: node.x !== undefined ? node.x : 0
@@ -1157,8 +1249,8 @@ VPage {
             }
         }
 
-        NodePort { nodeId: card.node.id !== undefined ? card.node.id : -1; output: false; x: -width / 2; y: 16 - height / 2 }
-        NodePort { nodeId: card.node.id !== undefined ? card.node.id : -1; output: true; x: card.width - width / 2; y: 16 - height / 2 }
+        NodePort { enabled: card.node.fixedOrder !== true; nodeId: card.node.id !== undefined ? card.node.id : -1; output: false; x: -width / 2; y: 16 - height / 2 }
+        NodePort { enabled: card.node.fixedOrder !== true; nodeId: card.node.id !== undefined ? card.node.id : -1; output: true; x: card.width - width / 2; y: 16 - height / 2 }
 
         // Per-card adapter so ColourPanel edits THIS colour node: reads its own
         // state, writes through the selected-layer setters after selecting it.
@@ -1241,9 +1333,9 @@ VPage {
                         veyra.setEffectPosition(index, card.x, card.y)
                         card.x = Qt.binding(() => card.node.x); card.y = Qt.binding(() => card.node.y)
                         card.animate = true
-                        if (hot) {
+                        if (hot && !card.node.fixedOrder) {
                             if (veyra.insertNodeAfter(id, hot.from)) veyra.logUi("ui-node", "insert " + id + " after " + hot.from)
-                        } else if (card.linked && (alt || Math.abs(card.y - oy) > 220)) {
+                        } else if (card.linked && !card.node.fixedOrder && (alt || Math.abs(card.y - oy) > 220)) {
                             root.detach(id, false); return
                         }
                         Qt.callLater(() => root.settle("n" + id))
@@ -1253,9 +1345,9 @@ VPage {
                         card.x = ox + (centroid.scenePosition.x - start.x) / root.zoom
                         card.y = oy + (centroid.scenePosition.y - start.y) / root.zoom
                         const alt = (centroid.modifiers & Qt.AltModifier) !== 0
-                        const e = (!card.linked || alt) ? root.nearestLink(card.x + card.width / 2, card.y + 30, card.node.id) : null
+                        const e = !card.node.fixedOrder && (!card.linked || alt) ? root.nearestLink(card.x + card.width / 2, card.y + 30, card.node.id) : null
                         root.hotFrom = e ? e.from : -1; root.hotTo = e ? e.to : -1
-                        card.willDetach = card.linked && (alt || Math.abs(card.y - oy) > 220)
+                        card.willDetach = card.linked && !card.node.fixedOrder && (alt || Math.abs(card.y - oy) > 220)
                         wires.requestPaint()
                     }
                 }
@@ -1306,6 +1398,8 @@ VPage {
                                 case "pending": return qsTr("等待样本")
                                 case "stopped": return qsTr("未播放")
                                 case "hdr-sdr": return qsTr("SDR显示未转换")
+                                case "beauty-bypass": return qsTr("已旁路")
+                                case "beauty-unsupported": return qsTr("图片暂不支持")
                                 case "fg-skipped": return qsTr("预算拒绝")
                                 default: return qsTr("不计时")
                                 }
@@ -1319,14 +1413,15 @@ VPage {
                     VIcon { visible: card.locked; name: "key"; size: 10; color: Theme.t3 }
                     VSwitch {
                         objectName: "node-enable-" + card.node.id
-                        checked: card.node.enabled === true
-                        enabled: card.node.enabled === true || Support.available(veyra, card.node.type)
+                        checked: card.node.enabled === true && !(card.node.type === "beauty" && veyra.isImage && !root.browserSource)
+                        enabled: !(card.node.type === "beauty" && veyra.isImage && !root.browserSource) &&
+                            (card.node.enabled === true || Support.available(veyra, card.node.type))
                         opacity: enabled ? 1 : 0.4
                         onToggled: checked => veyra.setEffectEnabled(card.node.index, checked)
                     }
                     VButton {
                         objectName: "node-unlink-" + card.node.id
-                        visible: card.linked
+                        visible: card.linked && !card.node.fixedOrder
                         icon: true; ghost: true; iconName: "unlink"
                         onClicked: root.detach(card.node.id, true)
                     }
@@ -1342,6 +1437,7 @@ VPage {
                 sourceComponent: card.node.type === "nr" ? nrEditor
                                : card.node.type === "color" ? colourEditor
                                : card.node.type === "sr" ? srEditor
+                               : card.node.type === "beauty" ? beautyEditor
                                : card.node.type === "video-hdr" ? hdrEditor
                                : card.node.type === "frame-generation" ? fgEditor : null
             }
@@ -1400,6 +1496,63 @@ VPage {
                         current: String(veyra.videoSrQuality)
                         onPicked: id => veyra.videoSrQuality = parseInt(id)
                     }
+                }
+            }
+        }
+        Component {
+            id: beautyEditor
+            ColumnLayout {
+                objectName: "node-beauty-editor"
+                spacing: 6
+                readonly property bool imageUnsupported: veyra.isImage && !root.browserSource
+                Text {
+                    objectName: "node-beauty-order"
+                    Layout.fillWidth: true
+                    text: parent.imageUnsupported ? qsTr("暂不支持图片源；返回视频后沿用原美颜设置") :
+                        qsTr("GPUPixel算法移植 · SDR\n固定在超分和 NR 后、HDR 和补帧前；画布位置可移动")
+                    color: Theme.t3; font.family: Theme.fontUi; font.pixelSize: 11; wrapMode: Text.WordWrap
+                }
+                Repeater {
+                    model: [{key:"smoothing",label:qsTr("磨皮"),def:0.35},
+                            {key:"whitening",label:qsTr("美白"),def:0.10},
+                            {key:"detail",label:qsTr("细节恢复"),def:0}]
+                    delegate: VRow {
+                        required property var modelData
+                        enabled: !(veyra.isImage && !root.browserSource)
+                        opacity: enabled ? 1 : 0.5
+                        label: modelData.label
+                        value: modelData.key === "whitening" ? (veyra.beautyWhitening * 100).toFixed(2) + "%" :
+                            Math.round((modelData.key === "smoothing" ? veyra.beautySmoothing : veyra.beautyDetail) * 100) + "%"
+                        VSlider {
+                            objectName: "node-beauty-" + modelData.key
+                            implicitWidth: 100
+                            valueFromModel: true
+                            resettable: true; defaultValue: modelData.def
+                            from: 0; to: 1; inputScale: 100
+                            inputDecimals: modelData.key === "whitening" ? 2 : 0
+                            keyboardStepOverride: modelData.key === "whitening" ? 0.0001 : 0
+                            value: modelData.key === "smoothing" ? veyra.beautySmoothing :
+                                modelData.key === "whitening" ? veyra.beautyWhitening : veyra.beautyDetail
+                            onMoved: value => veyra.setBeautyParameter(modelData.key, value)
+                        }
+                    }
+                }
+                Text {
+                    objectName: "node-beauty-timing"
+                    Layout.fillWidth: true
+                    readonly property var timing: veyra.beautyMetrics
+                    text: veyra.isImage && !root.browserSource ? qsTr("暂不支持图片源 · 不显示美颜耗时") :
+                        !veyra.beautyEnabled ? qsTr("已关闭") :
+                        timing.measured ? qsTr("GPU 均值 ") + Number(timing.meanMs).toFixed(2) +
+                            " ms · P95 " + Number(timing.p95Ms).toFixed(2) + " ms · " + timing.samples + qsTr(" 个样本") +
+                            (timing.state === "frozen" ? qsTr(" · 已冻结") : "") :
+                        timing.status || qsTr("等待 GPU 样本；不显示估算耗时")
+                    color: Theme.t3; font.family: Theme.fontUi; font.pixelSize: 10; wrapMode: Text.WordWrap
+                }
+                Text {
+                    Layout.fillWidth: true
+                    text: qsTr("不做人脸定位；背景和文字也可能变化。HDR 输入自动旁路。")
+                    color: Theme.t3; font.family: Theme.fontUi; font.pixelSize: 10; wrapMode: Text.WordWrap
                 }
             }
         }
@@ -1569,9 +1722,11 @@ VPage {
             veyra.chain.filter(n => n.type === targetNode.type).length < descriptor.maxInstances
         title: targetNode.label || qsTr("节点")
         items: [
-            {label: qsTr("删除节点"), id: "delete", disabled: targetNode.mustBeLast === true, note: targetNode.mustBeLast ? qsTr("补帧固定末位，可关闭") : ""},
+            {label: qsTr("删除节点"), id: "delete", disabled: targetNode.mustBeLast === true || targetNode.fixedOrder === true,
+             note: targetNode.fixedOrder ? qsTr("美颜固定阶段，可关闭") : targetNode.mustBeLast ? qsTr("补帧固定末位，可关闭") : ""},
             {label: qsTr("复制节点"), id: "copy", disabled: !canCopy, note: canCopy ? qsTr("完整参数副本，旁置未连接") : qsTr("单例节点或数量已达上限")},
-            {label: qsTr("重置节点"), id: "reset"}
+            {label: qsTr("重置节点"), id: "reset",
+             disabled: targetNode.type === "beauty" && veyra.isImage && !root.browserSource}
         ]
         onPicked: (i, item) => {
             const index = veyra.nodeIndexForId(targetId)
@@ -1608,8 +1763,9 @@ VPage {
         objectName: "node-source-menu"
         title: qsTr("片源")
         items: (veyra.sourceTitle.length > 0
-                ? [{ label: veyra.sourceTitle, note: veyra.sourceFormatText, checked: true, icon: "video", act: "" }] : [])
+                ? [{ label: veyra.sourceTitle, note: veyra.sourceFormatText, checked: true, icon: root.browserSource ? "globe" : "video", act: "" }] : [])
             .concat([{ label: qsTr("打开文件…"), icon: "folder", act: "file" },
+                     { label: qsTr("浏览器增强…"), icon: "globe", act: "browser" },
                      { label: qsTr("PS5 串流…"), icon: "gamepad", act: "ps5" },
                      { label: qsTr("PC 串流…"), icon: "cast", act: "moonlight" },
                      { label: qsTr("Xbox 串流…"), icon: "gamepad", act: "xbox" },
@@ -1618,6 +1774,7 @@ VPage {
                      { label: qsTr("采集卡设置…"), icon: "settings", act: "capture" }])
         onPicked: (i, o) => {
             if (o.act === "file") veyra.openFileDialog()
+            else if (o.act === "browser") veyra.openBrowserDialog()
             else if (o.act === "ps5") veyra.openPs5Dialog()
             else if (o.act === "moonlight") veyra.openMoonlightDialog()
             else if (o.act === "xbox") veyra.openXboxDialog()

@@ -1,4 +1,5 @@
 #include "veyra/ui/PlayerUiFacade.h"
+#include "veyra/ui/PlayerSnapshotComparison.h"
 
 #include "veyra/RuntimePaths.h"
 #include "veyra/Log.h"
@@ -27,29 +28,6 @@ std::wstring wide(const std::string& s) {
     std::wstring r(n > 0 ? size_t(n) : 0, L'\0');
     if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), r.data(), n);
     return r;
-}
-// Only the fields the UI can show are compared. Comparing the whole struct is
-// fine too, but calling it out keeps the intent visible: a change here is what
-// makes the UI repaint.
-bool sameSnapshot(const veyra::engine::PlayerSnapshot& a, const veyra::engine::PlayerSnapshot& b) {
-    return a.transport == b.transport && a.sessionId == b.sessionId && a.position == b.position &&
-        a.duration == b.duration && a.frames == b.frames && a.generated == b.generated &&
-        a.status == b.status && a.backendWarning == b.backendWarning && a.sourceNotice == b.sourceNotice &&
-        a.applying == b.applying && a.rejectedRevision == b.rejectedRevision &&
-        a.desired == b.desired && a.applied == b.applied && a.nrActive == b.nrActive &&
-        a.srActive == b.srActive && a.fgActive == b.fgActive && a.failed == b.failed &&
-        a.volume == b.volume && a.muted == b.muted && a.selectedAudioTrack == b.selectedAudioTrack &&
-        a.audioTracks.size() == b.audioTracks.size() && a.running == b.running &&
-        a.sourceWidth == b.sourceWidth && a.sourceHeight == b.sourceHeight &&
-        a.sourceDisplayAspect == b.sourceDisplayAspect && a.sourceRotationDegrees == b.sourceRotationDegrees &&
-        a.capture == b.capture && a.image == b.image &&
-        a.playbackRate == b.playbackRate && a.vramRunawayMiB == b.vramRunawayMiB && a.vramFullscreenUnsafe == b.vramFullscreenUnsafe &&
-        a.metrics.resolution.base.width == b.metrics.resolution.base.width &&
-        a.metrics.resolution.base.height == b.metrics.resolution.base.height &&
-        a.metrics.resolution.nr.width == b.metrics.resolution.nr.width &&
-        a.metrics.resolution.nr.height == b.metrics.resolution.nr.height &&
-        a.metrics.resolution.output.width == b.metrics.resolution.output.width &&
-        a.metrics.resolution.output.height == b.metrics.resolution.output.height;
 }
 } // namespace
 
@@ -103,7 +81,7 @@ PlayerUiFacade::Frame PlayerUiFacade::poll() {
     }
     Frame frame;
     frame.snapshot = snapshot;
-    frame.changed = !haveLast_ || !sameSnapshot(snapshot, last_);
+    frame.changed = !haveLast_ || !samePlayerSnapshot(snapshot, last_);
     if (frame.changed) {
         last_ = snapshot;
         haveLast_ = true;

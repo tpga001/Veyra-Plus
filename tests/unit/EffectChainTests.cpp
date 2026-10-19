@@ -173,14 +173,15 @@ void testExistingChainContracts() {
     // 3. List order is the product order and NR defaults to exactly one layer.
     {
         const auto chain = toChain(populated());
-        check(chain.nodeCount == 6, "list chain has one node per stage");
+        check(chain.nodeCount == 7, "list chain has one node per stage including default-off beauty");
         check(chain.nodes[0].type == EffectType::Color &&
               chain.nodes[1].type == EffectType::SuperResolution &&
               chain.nodes[2].type == EffectType::NrEnhance &&
               chain.nodes[3].type == EffectType::Protection &&
-              chain.nodes[4].type == EffectType::VideoHdr &&
-              chain.nodes[5].type == EffectType::FrameGeneration,
-              "list chain is colour, SR, NR, protection, HDR, frame generation");
+              chain.nodes[4].type == EffectType::Beauty && !chain.nodes[4].enabled &&
+              chain.nodes[5].type == EffectType::VideoHdr &&
+              chain.nodes[6].type == EffectType::FrameGeneration,
+              "list chain is colour, SR, NR, protection, default-off beauty, HDR, frame generation");
         check(chain.countOf(EffectType::NrEnhance) == 1, "list chain has a single NR layer");
     }
 

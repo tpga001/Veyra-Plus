@@ -4,6 +4,7 @@
 #include <dxgi1_6.h> // DXGI_HDR_METADATA_HDR10 (custom: HDR static metadata)
 #include "veyra/pipeline/GpuPassUtils.h"
 #include "veyra/engine/PreviewView.h"
+#include "veyra/engine/BrowserGpuPreview.h"
 #include "veyra/engine/HdrOutputTuning.h"
 #include "veyra/gfx/CommandSlotRing.h"
 #include "veyra/gfx/ReflexSession.h"
@@ -24,6 +25,10 @@ public:
     bool open(gfx::D3D12DeviceContext&, HWND, pipeline::EnhanceGraph&, bool captureCompatible=false, bool mediaClockPaced=false);
     bool present(gfx::D3D12DeviceContext&,gfx::CommandSlotRing&,pipeline::EnhanceGraph&,unsigned slot,bool generated,bool referencesValid=true,int comparison=0,bool baseReference=false,float split=.5f,pipeline::FrameIdentity identity={},PreviewView view={},int64_t sourcePts100ns=-1,bool retainUnchanged=false);
     void close();
+    void requestBrowserPreview(BrowserPreviewRequest request,uint64_t activeSessionId,bool playing=true){browserPreview_.request(request,activeSessionId,playing);}
+    BrowserPreviewSnapshot browserPreviewSnapshot(){return browserPreview_.snapshot();}
+    void invalidateBrowserPreviewGeneration(){browserPreview_.invalidateGeneration();}
+    bool readBrowserPreviewFrameForTest(gfx::D3D12DeviceContext&,gfx::CommandSlotRing&,sink::RgbaImage&);
     // Present-sink providers (XeSS) block inside Present while pacing
     // their generated frames. A helper-thread Present was tried on
     // 2026-09-22 (X3): the provider then estimated its period from the
@@ -44,6 +49,8 @@ public:
     bool reflexDisablePending()const{return reflex_.disablePending();}
     bool pacingActive()const{return sink_.pacingActive();}
     uint64_t generation()const{return generation_;}
+    uint64_t outputSwapchainAddress()const{return reinterpret_cast<uint64_t>(sink_.swapChain());}
+    uint64_t outputGeneration()const{return (generation_<<32)^sink_.outputGeneration();}
     // Explicit integration-test capture only; never called by playback/export.
     bool readPresentedFrameForTest(gfx::D3D12DeviceContext&,gfx::CommandSlotRing&,sink::RgbaImage&);
     // Test-only buffer reference for lossless HDR readback. Drains the private
@@ -90,6 +97,7 @@ private:
     gfx::CommandSlotRing presentationRing_;
     diagnostics::GpuTimer gpuTimer_;
     gfx::PresentSink sink_;
+    BrowserGpuPreview browserPreview_;
     pipeline::GraphicsPass pass_;
     pipeline::ComputePass presentMotionPass_;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>,2> presentMotion_;

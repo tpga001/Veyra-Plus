@@ -1,0 +1,14 @@
+GPUPixel basic beauty port
+Copyright (c) 2021 PixPark.
+Source: https://github.com/pixpark/gpupixel
+Apache License, Version 2.0; see LICENSE and PROVENANCE.json.
+Veyra modifications (2026): GLSL to D3D12 compute HLSL, explicit SDR transfer,
+reused blur for variance, alpha preserved, disabled/HDR bypass and GPU timing.
+Stage12 (2026-10-14): whitening strength now blends encoded input toward the
+complete four-LUT full-strength result. Zero skips the whitening sequence;
+the full-strength endpoint is retained. This intentional Veyra adaptation
+removes the upstream control's full gray/origin/skin pregrade jump at 0+.
+Included lookup_gray/origin/skin/light PNG bytes are tracked src/res assets
+under the upstream root Apache-2.0 license; no separate asset exception was
+found in that checkout. No Mars, VNN, face landmark models or SDK binaries.
+This is a shader algorithm port, not execution of the GPUPixel OpenGL DLL.

@@ -8,6 +8,7 @@
 #include "veyra/pipeline/ResolutionPlan.h"
 #include "veyra/pipeline/NrTemporalPass.h"
 #include "veyra/pipeline/NrHoldPass.h"
+#include "veyra/pipeline/BeautyPass.h"
 #include "veyra/pipeline/FramePacket.h" // ColorDescription, for the HDR display metadata
 
 // EnhanceGraph - the real unified processing graph (Playbook R3.2).
@@ -83,6 +84,19 @@ struct EnhanceGraphDesc {
     uint32_t workWidth = 3840;
     uint32_t workHeight = 2160;
     uint32_t videoSrQuality=0;
+    // Runtime-only SDR browser DLSS/RTX/FSR input. Raw source, references and final
+    // output retain their original extents. Empty means the full source.
+    Extent videoSrInputExtent{};
+    Extent srSamplingExtent() const {
+        return videoSrInputExtent.valid()?videoSrInputExtent:Extent{sourceWidth,sourceHeight};
+    }
+    bool sourceSizedSr() const {
+        return enableSr&&(videoSrQuality==0||videoSrQuality==engine::kVideoSrFsr)&&videoSrInputExtent.valid();
+    }
+    bool sourceSizedDlss() const {return sourceSizedSr()&&videoSrQuality==0;}
+    bool sourceSizedFsrReset(bool historyReset,uint64_t evaluations) const {
+        return sourceSizedSr()&&videoSrQuality==engine::kVideoSrFsr&&(historyReset||evaluations==0);
+    }
     bool enableSr = false;       // upscale source -> work extent (1:1 bypass otherwise)
     bool enableNr = true;
     bool nrBeforeSr = false;
@@ -104,6 +118,7 @@ struct EnhanceGraphDesc {
     bool srUsesFlow()const{return engine::motionUsesFlow(srMotion);}
     bool nrUsesFlow()const{return engine::motionUsesFlow(nrMotion);}
     engine::VideoHdrSettings videoHdr;
+    engine::BeautySettings beauty;
     // Custom: static HDR output tuning (see HdrOutputTuning.h). Both blocks are
     // live: the curve reaches the present blit, the metadata the display.
     engine::HdrCurveSettings hdrCurve;
@@ -120,6 +135,7 @@ struct EnhanceGraphDesc {
     // The driver's bytes are uploaded 1:1 and unpacked by the upload shader.
     uint32_t packedInput = 0;
     bool stillImage = false;     // no temporal motion/FG history for a single image
+    bool beautySupported() const {return !stillImage&&beauty.supported(hdrInput,hdrWorking());}
     uint32_t nrWidth=0,nrHeight=0; // zero preserves legacy native working extent
     uint32_t flowWidth=0,flowHeight=0; // zero preserves legacy source-space NVOF extent
     uint32_t fgMultiplier=2;
@@ -308,6 +324,8 @@ struct EnhanceGraphDesc {
     }
     std::string_view validateFixedExecutionPlan() const {
         if(!fixedExecutionPlanError.empty())return fixedExecutionPlanError;
+        if(sourceSizedSr()&&(Extent{flowWidth,flowHeight}!=srSamplingExtent()||amdFlowHalfResolution))
+            return "source-sized SR motion grid differs from its sampling extent";
         if(!fixedExecutionPlan)return {};
         using engine::EffectType;
         const auto& plan=*fixedExecutionPlan;
@@ -324,7 +342,7 @@ struct EnhanceGraphDesc {
         for(uint32_t i=0;i<plan.stepCount;++i){
             const auto& step=plan.steps[i];const auto type=size_t(step.type);
             if(type>=counts.size())return "unknown fixed execution stage";
-            int rank=int(type);
+            int rank=step.type==EffectType::Beauty?4:step.type==EffectType::VideoHdr?5:step.type==EffectType::FrameGeneration?6:int(type);
             if(nrBeforeSr){
                 if(step.type==EffectType::NrEnhance)rank=1;
                 if(step.type==EffectType::Protection)rank=2;
@@ -341,8 +359,9 @@ struct EnhanceGraphDesc {
                     else if(preSrColor(step.parameterIndex))rank=3;
                     else if(interNrColorTarget(step.parameterIndex)<engine::kMaxNrInstances)rank=nrBeforeSr?1:2;
                 }
-                if(step.type==EffectType::VideoHdr)rank=5;
-                if(step.type==EffectType::FrameGeneration)rank=6;
+                if(step.type==EffectType::Beauty)rank=5;
+                if(step.type==EffectType::VideoHdr)rank=6;
+                if(step.type==EffectType::FrameGeneration)rank=7;
             }
             if(split){
                 if(step.type==EffectType::Protection){
@@ -357,8 +376,9 @@ struct EnhanceGraphDesc {
                     else if(preSrColor(step.parameterIndex))rank=2;
                     else if(interNrColorTarget(step.parameterIndex)<engine::kMaxNrInstances)rank=afterSr?4:1;
                 }
-                if(step.type==EffectType::VideoHdr)rank=7;
-                if(step.type==EffectType::FrameGeneration)rank=8;
+                if(step.type==EffectType::Beauty)rank=7;
+                if(step.type==EffectType::VideoHdr)rank=8;
+                if(step.type==EffectType::FrameGeneration)rank=9;
             }
             if(rank<lastRank)return "ordered node execution is not supported by fixed dispatcher";
             lastRank=rank;
@@ -393,7 +413,8 @@ struct EnhanceGraphDesc {
     // Caller retains any supplied resources until graph drain/shutdown.
     std::function<void(NVSDK_NGX_Parameter*,ID3D12Resource*,ID3D12Resource*,uint32_t,uint32_t)> nrParameterProbe;
     // Isolated SR diagnostics only; unset by product entry points. Borrowed
-    // working-extent RG16F current->previous pixel motion, ready in SRV state.
+    // RG16F current->previous pixel motion, ready in SRV state: render extent
+    // for source-sized browser DLSS, working extent for the legacy path.
     // Caller retains it through graph drain/shutdown, synchronizing any writes.
     ID3D12Resource* srMotionProbe = nullptr;
     // Same borrowed diagnostic contract as srMotionProbe, for FG only.
@@ -501,6 +522,8 @@ public:
         uint64_t nrEvaluateCount = 0;
         uint64_t pausedNrResidualReuses = 0;
         uint64_t srEvaluateCount = 0;
+        Extent videoSrInputExtent{}; // actual DLSS/RTX input; empty when neither is active
+        uint64_t beautyEvaluateCount = 0;
         uint64_t nvofExecuteCount = 0;
         uint64_t amdOfExecuteCount = 0;
         uint64_t gpuDisExecuteCount = 0;
@@ -518,6 +541,12 @@ public:
     uint32_t sourceHeight() const { return srcH_; }
     uint32_t workWidth() const { return workW_; }
     uint32_t workHeight() const { return workH_; }
+    Extent videoSrInputExtent() const {
+        if(!initialized_||!srEnabled_)return {};
+        if(videoSrBackend_)return {videoSrW_,videoSrH_};
+        if(srBackend_||fsrSrBackend_)return desc_.srSamplingExtent();
+        return {};
+    }
     uint32_t nrWidth() const {return nrW_;}
     uint32_t nrLayerCount() const {return uint32_t(nrInstances_.size());}
     uint32_t nrHeight() const {return nrH_;}
@@ -535,6 +564,15 @@ public:
     bool fgEnabled() const { return fgEnabled_; }
     bool hdrOutput() const { return desc_.hdrOutput; }
     bool videoHdrActive() const {return desc_.convertVideoHdr();}
+    bool beautyActive() const {return desc_.beautySupported()&&beautyPass_&&desc_.beauty.hasEffect()&&metrics_.beautyEvaluateCount>0;}
+    std::wstring beautyStatus() const {
+        if(desc_.stillImage)return L"暂不支持图片源：美颜已旁路";
+        if(!desc_.beauty.enabled)return L"美颜已关闭";
+        if(!desc_.beauty.supported(desc_.hdrInput,desc_.hdrWorking()))return L"原生 HDR 输入：SDR 美颜已旁路";
+        if(beautyUnavailable_)return L"美颜 GPU 初始化失败：已旁路，其他增强继续";
+        if(!desc_.beauty.hasEffect())return L"美颜参数均为零：未执行";
+        return metrics_.beautyEvaluateCount?L"GPUPixel 基础美颜已执行（超分 / NR 后，补帧前）":L"美颜已准备，等待实际帧";
+    }
     // Custom: static HDR output tuning. The curve is read by the present blit,
     // the metadata is sent to the display.
     const engine::HdrCurveSettings& hdrCurve() const {return desc_.hdrCurve;}
@@ -583,6 +621,12 @@ public:
     ID3D12Resource* diagnosticPreSrProtection() const { return preSrProtectionRgba_.Get(); }
     ID3D12Resource* diagnosticInterNrProtection() const { return interNrProtectionRgba_.Get(); }
     ID3D12Resource* diagnosticVideoSrInput() const { return videoSrInput_.Get(); }
+    ID3D12Resource* diagnosticSourceSizedSrInput() const {return sampledSrInput_.Get();}
+    ID3D12Resource* diagnosticSourceSizedSrDepth() const {return sampledSrDepth_.Get();}
+    ID3D12Resource* diagnosticSourceSizedSrMotion() const {return sampledSrInput_?flowTex_.Get():nullptr;}
+    ID3D12Resource* diagnosticDlssSrInput() const {return desc_.sourceSizedDlss()?sampledSrInput_.Get():nullptr;}
+    ID3D12Resource* diagnosticDlssSrDepth() const {return desc_.sourceSizedDlss()?sampledSrDepth_.Get():nullptr;}
+    ID3D12Resource* diagnosticDlssSrMotion() const {return desc_.sourceSizedDlss()?flowTex_.Get():baseFlow_.Get();}
     ID3D12Resource* diagnosticVideoSrOutput() const { return videoSrOutput_.Get(); }
     ID3D12Resource* diagnosticNrLayerInput(size_t index) const { return index < nrInstances_.size() ? nrInstances_[index]->input() : nullptr; }
     ID3D12Resource* diagnosticNrLayerOutput(size_t index) const { return index < nrInstances_.size() ? nrInstances_[index]->fullTarget() : nullptr; }
@@ -656,6 +700,7 @@ private:
     bool initialized_ = false;
 
     uint32_t srcW_ = 0, srcH_ = 0, workW_ = 3840, workH_ = 2160;
+    uint32_t videoSrW_=0,videoSrH_=0;
     uint32_t nrW_=0,nrH_=0;
     uint32_t nvofW_ = 0, nvofH_ = 0, rawW_ = 0, rawH_ = 0, nvofGrid_ = 4, selectedGrid_ = 4;
     bool srEnabled_ = false, nrEnabled_ = false, fgEnabled_ = false, nvofStandalone_ = false;
@@ -678,6 +723,10 @@ private:
     size_t rgbPitch_=0;
     ComPtr<ID3D12Resource> workRgba_;
     ComPtr<ID3D12Resource> videoSrInput_,videoSrOutput_;
+    // Browser-only DLSS/FSR sampling grid. Native/local/export allocate none.
+    ComPtr<ID3D12Resource> sampledSrInput_,sampledSrDepth_,sampledSrZeroMotion_;
+    ComPtr<ID3D12Resource> upSampledSrDepth_,upSampledSrZeroMotion_;
+    size_t sampledSrPitch_=0;
     ComPtr<ID3D12Resource> videoHdrInput_,videoHdrOutput_;
     ComPtr<ID3D12Resource> residualRgba_,nrFlow_,baseFlow_;
     ComPtr<ID3D12Resource> preSrProtectionRgba_;
@@ -726,6 +775,8 @@ private:
     // setting is non-zero; a default (0) session never allocates it and the
     // dispatch is skipped, so the disabled path is unchanged.
     std::unique_ptr<NrHoldPass> nrHoldPass_;
+    std::unique_ptr<BeautyPass> beautyPass_;
+    bool beautyUnavailable_=false;
     // 纹理 / 清晰度 / 去朦胧 of the list grade fused into input conversion (srcRgba_).
     ColorDetailPass colorDetail_;
     // The texture the rest of the graph reads as "the NR result". Without the

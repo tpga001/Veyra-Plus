@@ -1,0 +1,15 @@
+{
+  "source": "https://github.com/SAOG0721/Magpie",
+  "commit": "931be4541e339612f39c80bca224dd4687872fcd",
+  "license": "GPL-3.0-or-later",
+  "originalSha256": {
+    "content.js": "c9714374937e10ed679dc5466da58efb6dd648b3a18d684f1291d0e2ce4292ce",
+    "video-geometry.js": "b0b975c2268c631e5153d44ba35b6bc5f2b2c4f460fa6f92906965583591aeab",
+    "service-worker.js": "85bdceb69b2d342e2d674a51dcc8bcbaef7d187eb118946c86ffd00998d5458c",
+    "popup.css": "259b199cf2d9d9160f4c553af17943ed1f4a26dcea71fc6b22d6b3ca7d73c87e",
+    "tests/browser-decoded-geometry.test.cjs": "dd1d651b1085612e1a1a808560e2f436dac7dbd7c39a6ddf60131a665f3de080"
+  },
+  "extensionId": "ahiondbmdpeodpldmaclilcggpcdaleg",
+  "localExtensionVersion": "0.2.3",
+  "localChanges": "Native-authorized continuation of the same visible browser video while the registered Veyra monitor is foreground, paused-source identity retention with fresh same-source resume, safe source z-order, read-only background status synchronization, foreground delivery safeguards, current-source diagnostics and per-video media epochs; bounded side effects, recoverable requests, one-second metadata cadence and native-authority-safe polling without delaying confirmed ON reports. No additional third-party code imported."
+}

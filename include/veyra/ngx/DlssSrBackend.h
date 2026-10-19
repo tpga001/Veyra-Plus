@@ -31,13 +31,14 @@ public:
         uint32_t outputHeight;
         int perfQuality; // NVSDK_NGX_PerfQuality_Value
         bool enableOutputSubrects;
+        bool motionVectorsLowRes=false; // opt-in render-sized vectors; legacy output-sized path is unchanged
     };
 
     struct EvalDesc {
         ID3D12Resource* color;       // linear input (render resolution)
         ID3D12Resource* output;      // output (target resolution)
         ID3D12Resource* depth;       // estimated depth or explicitly zero fallback
-        ID3D12Resource* motionVectors; // current-to-previous, output pixels; zero on reset
+        ID3D12Resource* motionVectors; // current-to-previous pixels of the selected motion grid; zero on reset
         bool reset;
         float jitterOffsetX;
         float jitterOffsetY;

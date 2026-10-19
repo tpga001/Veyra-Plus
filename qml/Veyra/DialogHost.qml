@@ -15,13 +15,17 @@ import QtQuick.Layouts
 
 Item {
     id: host
+    objectName: "source-dialog-host"
     anchors.fill: parent
     z: 100
 
     // Which dialog is showing: "" | capture | ps5 | moonlight | xbox | screen | subtitle | audio
     property string dialog: ""
+    property var onlineSubtitleService: veyra.onlineSubtitles
 
     function open(key) {
+        if (host.dialog === "online-subtitle" && key !== host.dialog) { host.onlineSubtitleService.cancel(); tokenField.text = "" }
+        if (key === "online-subtitle") onlineSubtitleDialog.resetForOpen()
         if (key === "save") saveDialog.resetForOpen()
         if (key === "manage") {
             manageDialog.mode = veyra.nodeMode === 1 ? "node" : "list"
@@ -30,13 +34,17 @@ Item {
         veyra.logUi("ui-dialog", "open " + key + " (was " + (host.dialog || "none") + ")")
         host.dialog = key
     }
-    function close() { host.dialog = "" }
+    function close() {
+        if (host.dialog === "online-subtitle") { host.onlineSubtitleService.cancel(); tokenField.text = "" }
+        host.dialog = ""
+    }
 
     signal startCapture()
     signal startPs5()
     signal startMoonlight()
     signal startXbox()
     signal startScreen()
+    signal showBrowserSettings()
 
     // Scrim (M16): the design dims the page behind the dialog, opacity .2s linear.
     // The native video window cannot be dimmed from QML; only the dialog panel is cut
@@ -207,6 +215,144 @@ Item {
                     }
                 }
             }
+        }
+    }
+
+
+    // Browser capture is another source. Picture and audio stay in the original page.
+    DLayer {
+        id: browserDialog
+        objectName: "browser-dialog"
+        key: "browser"
+        glyph: "globe"
+        title: qsTr("浏览器增强")
+        sub: qsTr("在 Chrome 或 Edge 的原视频区域显示增强画面")
+        dialogWidth: Math.min(660, host.width - 24)
+        foot: qsTr("声音、播放与字幕由浏览器控制")
+        actions: [{ label: qsTr("关闭") }, { label: qsTr("画质与监控"), primary: true, icon: "sliders" }]
+        onActionTriggered: label => {
+            host.close()
+            if (label === qsTr("画质与监控")) host.showBrowserSettings()
+        }
+        readonly property var info: veyra.browserTelemetry || ({})
+        readonly property string sampleNote: info.live ? qsTr("播放中 · 实时采样")
+            : info.hasLastSample ? qsTr("已冻结 · 最近数据") + (info.sampleAgeMs >= 0 ? " · " + (info.sampleAgeMs / 1000).toFixed(1) + qsTr(" 秒前") : "")
+            : qsTr("等待视频，尚无采样")
+        function extent(w, h) { return w > 0 && h > 0 ? w + "×" + h : qsTr("未测") }
+        function activity(active, lastActive) {
+            if (info.live) return active ? qsTr("运行中") : qsTr("未启用")
+            if (info.hasLastSample) return lastActive ? qsTr("上次已启用") : qsTr("上次未启用")
+            return qsTr("未测")
+        }
+
+        DSection { text: qsTr("浏览器来源") }
+        DGroup {
+            VRow {
+                label: qsTr("启用浏览器增强")
+                hint: !veyra.browserListening ? qsTr("本地连接暂不可用") : qsTr("增强当前播放的视频；暂停或结束时冻结最近数据，关闭后恢复网页原画")
+                VSwitch {
+                    id: browserToggle
+                    objectName: "browser-source-toggle"
+                    checked: veyra.browserEnabled
+                    enabled: veyra.browserListening
+                    onToggled: checked => veyra.setBrowserEnabled(checked)
+                    Connections {
+                        target: veyra
+                        function onBrowserChanged() { browserToggle.checked = veyra.browserEnabled }
+                    }
+                }
+            }
+            VRow {
+                label: qsTr("连接状态")
+                hintBelow: true
+                hint: browserDialog.info.status || veyra.browserStatus
+                VTag {
+                    objectName: "browser-source-state"
+                    text: !veyra.browserEnabled ? qsTr("已关闭") : browserDialog.info.live ? qsTr("播放中") : browserDialog.info.hasLastSample ? qsTr("已冻结") : qsTr("等待视频")
+                    kind: browserDialog.info.live ? "ok" : veyra.browserEnabled ? "warn" : ""
+                }
+            }
+            VRow {
+                label: qsTr("浏览器扩展")
+                hint: qsTr("将此目录中的扩展加载到 Chrome 或 Edge")
+                VButton { objectName: "browser-extension-folder"; text: qsTr("扩展目录"); iconName: "folder"; onClicked: veyra.openBrowserExtensionFolder() }
+            }
+        }
+
+        DSection { text: qsTr("来源尺寸") }
+        DGroup {
+            VRow {
+                objectName: "browser-original-size"
+                label: qsTr("原视频")
+                hint: qsTr("网页视频报告的原始尺寸与采样帧率")
+                value: browserDialog.extent(browserDialog.info.originalWidth, browserDialog.info.originalHeight)
+                    + (browserDialog.info.originalFpsKnown ? qsTr(" · 采样 ") + Number(browserDialog.info.originalFps).toFixed(2) + " fps" : "")
+            }
+            VRow {
+                objectName: "browser-capture-size"
+                label: qsTr("捕获区域")
+                hint: qsTr("桌面合成器输入；捕获帧率未测量")
+                value: browserDialog.extent(browserDialog.info.captureWidth, browserDialog.info.captureHeight)
+            }
+            VRow {
+                objectName: "browser-rtx-input-mode-row"
+                label: qsTr("RTX \u5904\u7406\u8f93\u5165")
+                hintBelow: true
+                hint: qsTr("\u6309\u539f\u7247\u5c3a\u5bf8\u91cd\u91c7\u6837\u6355\u83b7\u753b\u9762\u4ee5\u51cf\u5c11\u8fd0\u7b97\uff1b\u4e0d\u662f\u539f\u59cb\u89e3\u7801\u5e27\uff0c\u7ec6\u5c0f\u6587\u5b57\u53ef\u80fd\u6709\u53d8\u5316\u3002\u4ec5 RTX \u89c6\u9891\u8d85\u5206\u751f\u6548\u3002")
+                VSeg {
+                    objectName: "browser-rtx-input-mode"
+                    options: [{ id: "source", label: qsTr("\u6309\u539f\u7247\u5c3a\u5bf8") },
+                              { id: "capture", label: qsTr("\u5b8c\u6574\u6355\u83b7") }]
+                    current: veyra.preferences.browserRtxSourceSized !== false ? "source" : "capture"
+                    onPicked: id => veyra.setPreference("browserRtxSourceSized", id === "source")
+                }
+            }
+            VRow {
+                objectName: "browser-rtx-input-size"
+                label: qsTr("\u8d85\u5206\u5b9e\u9645\u8f93\u5165")
+                hint: qsTr("\u6267\u884c\u8d85\u5206\u7684\u771f\u5b9e\u7eb9\u7406\u5c3a\u5bf8\uff1b\u672a\u6267\u884c\u65f6\u4e0d\u4f30\u7b97")
+                value: browserDialog.extent(browserDialog.info.videoSrInputWidth, browserDialog.info.videoSrInputHeight)
+            }
+            VRow {
+                objectName: "browser-target-size"
+                label: qsTr("内部超分目标")
+                hint: qsTr("超分处理尺寸；网页视频的显示尺寸保持原样")
+                value: browserDialog.extent(browserDialog.info.targetWidth, browserDialog.info.targetHeight)
+            }
+            VRow {
+                objectName: "browser-video-size"
+                label: qsTr("网页显示区域")
+                value: browserDialog.extent(browserDialog.info.videoWidth, browserDialog.info.videoHeight)
+            }
+            VRow {
+                objectName: "browser-display-size"
+                label: qsTr("所在显示器")
+                value: browserDialog.extent(browserDialog.info.displayWidth, browserDialog.info.displayHeight)
+            }
+        }
+
+        DSection { text: qsTr("处理链") }
+        DGroup {
+            VRow {
+                objectName: "browser-sample-state"
+                label: qsTr("监控状态")
+                hintBelow: true
+                hint: browserDialog.sampleNote
+                value: browserDialog.info.live ? qsTr("实时") : browserDialog.info.hasLastSample ? qsTr("已冻结") : qsTr("未测")
+            }
+            VRow { label: qsTr("超分"); value: browserDialog.activity(browserDialog.info.srActive, browserDialog.info.lastSrActive) }
+            VRow { label: qsTr("NR 增强"); value: browserDialog.activity(browserDialog.info.nrActive, browserDialog.info.lastNrActive) }
+            VRow { label: qsTr("补帧"); value: browserDialog.activity(browserDialog.info.fgActive, browserDialog.info.lastFgActive) }
+            VRow {
+                objectName: "browser-submit-rate"
+                label: browserDialog.info.submitFpsLabel || qsTr("提交帧率")
+                hint: browserDialog.info.live ? qsTr("\u8f6f\u4ef6 / SDK \u63d0\u4ea4\u8ba1\u6570\uff0c\u4e0e\u5b9e\u9645\u663e\u793a\u5e27\u7387\u5206\u5f00\u7edf\u8ba1") : browserDialog.sampleNote
+                value: browserDialog.info.submitFpsKnown ? Number(browserDialog.info.submitFps).toFixed(2) + " fps" : qsTr("未测")
+            }
+            
+            
+            
+            
         }
     }
 
@@ -551,7 +697,7 @@ Item {
                     spacing: 6
                     VButton { text: qsTr("登录 PSN"); ghost: true; enabled: !veyra.ps5.busy; onClicked: veyra.ps5PsnLogin() }
                     VButton { text: qsTr("提交登录结果"); ghost: true; enabled: !veyra.ps5.busy; onClicked: veyra.ps5PsnComplete() }
-                    VButton { text: qsTr("退出"); ghost: true; enabled: !veyra.ps5.busy && veyra.ps5.psnReady; onClicked: veyra.ps5PsnForget() }
+                    VButton { text: qsTr("退出"); ghost: true; enabled: !veyra.ps5.busy && veyra.ps5.psnReady === true; onClicked: veyra.ps5PsnForget() }
                 }
             }
         }
@@ -994,7 +1140,7 @@ Item {
                     spacing: 6
                     VSpinner { visible: xbDialog.st.busy === true; Layout.alignment: Qt.AlignVCenter }
                     VButton { objectName: "xbox-signin"; visible: !xbDialog.st.signedIn; text: qsTr("登录"); primary: true; enabled: !xbDialog.st.busy; onClicked: xbDialog.xb.signIn() }
-                    VButton { visible: xbDialog.st.signedIn; text: qsTr("退出登录"); ghost: true; enabled: !xbDialog.st.busy; onClicked: xbDialog.xb.signOut() }
+                    VButton { visible: xbDialog.st.signedIn === true; text: qsTr("退出登录"); ghost: true; enabled: !xbDialog.st.busy; onClicked: xbDialog.xb.signOut() }
                 }
             }
         }
@@ -1192,6 +1338,332 @@ Item {
         }
     }
 
+    // Online subtitles share the normal dialog/overlay path. Network work is
+    // asynchronous in the bridge; closing this panel cancels pending requests.
+    DLayer {
+        id: onlineSubtitleDialog
+        objectName: "online-subtitle-dialog"
+        key: "online-subtitle"
+        glyph: "cc"
+        title: qsTr("在线字幕")
+        sub: compactHeight ? "" : qsTr("搜索中文字幕，选择匹配版本后下载并加载。")
+        dialogWidth: Math.max(1, Math.min(700, host.width - 24))
+        actions: compactHeight && service.configured && !editingToken
+                 ? [{ label: qsTr("服务设置") }, { label: qsTr("关闭") }]
+                 : [{ label: qsTr("关闭") }]
+        onActionTriggered: label => {
+            if (label === qsTr("服务设置")) { tokenField.text = ""; editingToken = true }
+            else host.close()
+        }
+        foot: compactHeight && service.configured ? qsTr("已配置") : ""
+        readonly property bool compactHeight: host.height < 440
+        readonly property var service: host.onlineSubtitleService
+        property bool editingToken: false
+        property bool searchStarted: false
+        function resetForOpen() {
+            tokenField.text = ""
+            editingToken = !service.configured
+            searchStarted = false
+        }
+        function saveToken() {
+            const accepted = service.configureToken(tokenField.text.trim())
+            tokenField.text = ""
+            if (accepted) editingToken = false
+        }
+        function searchNow() {
+            if (!service.available || !service.configured || service.busy || service.query.trim().length === 0) return
+            searchStarted = true
+            service.search()
+        }
+
+        DNote {
+            objectName: "online-subtitle-unavailable"
+            visible: !onlineSubtitleDialog.service.available
+            text: qsTr("请先打开本地视频。在线字幕暂不用于浏览器视频、图片或采集片源。")
+        }
+        DSection { visible: !onlineSubtitleDialog.compactHeight || !onlineSubtitleDialog.service.configured || onlineSubtitleDialog.editingToken; text: qsTr("字幕服务") }
+        RowLayout {
+            visible: !onlineSubtitleDialog.compactHeight || !onlineSubtitleDialog.service.configured || onlineSubtitleDialog.editingToken
+            Layout.fillWidth: true
+            Layout.topMargin: 6
+            spacing: 8
+            Text {
+                Layout.fillWidth: true
+                text: onlineSubtitleDialog.service.configured ? qsTr("射手网 Token 已保存") : qsTr("首次使用需填写射手网 Token")
+                color: onlineSubtitleDialog.service.configured ? Theme.ok : Theme.t2
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fsSmall
+                wrapMode: Text.WordWrap
+            }
+            VButton {
+                objectName: "online-subtitle-edit-token"
+                visible: onlineSubtitleDialog.service.configured && !onlineSubtitleDialog.editingToken
+                text: qsTr("更换")
+                ghost: true
+                onClicked: { tokenField.text = ""; onlineSubtitleDialog.editingToken = true }
+            }
+            VButton {
+                objectName: "online-subtitle-clear-token"
+                visible: onlineSubtitleDialog.service.configured
+                text: qsTr("移除")
+                ghost: true
+                enabled: !onlineSubtitleDialog.service.busy
+                onClicked: {
+                    onlineSubtitleDialog.service.clearToken()
+                    tokenField.text = ""
+                    onlineSubtitleDialog.editingToken = true
+                }
+            }
+        }
+        ColumnLayout {
+            visible: onlineSubtitleDialog.editingToken || !onlineSubtitleDialog.service.configured
+            Layout.fillWidth: true
+            Layout.topMargin: 8
+            spacing: 8
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 40
+                    implicitHeight: 32
+                    radius: 9
+                    color: Qt.rgba(1, 1, 1, 0.04)
+                    border.width: 1
+                    border.color: tokenField.activeFocus ? Theme.accent : Theme.stroke
+                    TextInput {
+                        id: tokenField
+                        objectName: "online-subtitle-token"
+                        anchors.fill: parent
+                        anchors.leftMargin: 10
+                        anchors.rightMargin: 10
+                        verticalAlignment: TextInput.AlignVCenter
+                        clip: true
+                        echoMode: TextInput.Password
+                        inputMethodHints: Qt.ImhHiddenText | Qt.ImhSensitiveData | Qt.ImhNoPredictiveText
+                        selectByMouse: true
+                        color: Theme.t1
+                        font.family: Theme.fontUi
+                        font.pixelSize: Theme.fsBody
+                        onAccepted: if (!onlineSubtitleDialog.service.busy && text.trim().length > 0) onlineSubtitleDialog.saveToken()
+                    }
+                    Text {
+                        anchors.left: parent.left
+                        anchors.leftMargin: 10
+                        anchors.verticalCenter: parent.verticalCenter
+                        visible: tokenField.text.length === 0
+                        text: qsTr("粘贴射手网 Token")
+                        color: Theme.t3
+                        font.family: Theme.fontUi
+                        font.pixelSize: Theme.fsBody
+                    }
+                }
+                VButton {
+                    objectName: "online-subtitle-save-token"
+                    text: qsTr("保存")
+                    primary: true
+                    enabled: !onlineSubtitleDialog.service.busy && tokenField.text.trim().length > 0
+                    onClicked: onlineSubtitleDialog.saveToken()
+                }
+            }
+            VButton {
+                objectName: "online-subtitle-get-token"
+                text: qsTr("打开射手网获取 Token")
+                ghost: true
+                onClicked: Qt.openUrlExternally("https://assrt.net/usercp.php")
+            }
+            Text {
+                Layout.fillWidth: true
+                text: qsTr("Token 仅保存在本机，保存后不会在界面中回显。")
+                color: Theme.t3
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fsSmall
+                wrapMode: Text.WordWrap
+            }
+        }
+        DSection { text: qsTr("按片名搜索") }
+        RowLayout {
+            Layout.fillWidth: true
+            Layout.topMargin: 6
+            spacing: 8
+            VTextField {
+                objectName: "online-subtitle-query"
+                Layout.fillWidth: true
+                Layout.minimumWidth: 40
+                placeholder: qsTr("电影、剧集名称或文件名")
+                text: onlineSubtitleDialog.service.query
+                enabled: onlineSubtitleDialog.service.available && !onlineSubtitleDialog.service.busy
+                onTyped: text => onlineSubtitleDialog.service.query = text
+            }
+            VButton {
+                objectName: "online-subtitle-search"
+                text: qsTr("搜索")
+                primary: true
+                enabled: onlineSubtitleDialog.service.available && onlineSubtitleDialog.service.configured
+                         && !onlineSubtitleDialog.service.busy && onlineSubtitleDialog.service.query.trim().length > 0
+                onClicked: onlineSubtitleDialog.searchNow()
+            }
+        }
+        RowLayout {
+            Layout.fillWidth: true
+            Layout.topMargin: 8
+            spacing: 8
+            VSpinner { visible: onlineSubtitleDialog.service.busy; Layout.alignment: Qt.AlignVCenter }
+            Text {
+                objectName: "online-subtitle-status"
+                Layout.fillWidth: true
+                text: onlineSubtitleDialog.service.status
+                textFormat: Text.PlainText
+                color: Theme.t3
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fsSmall
+                wrapMode: Text.WordWrap
+            }
+            VButton {
+                objectName: "online-subtitle-cancel"
+                visible: onlineSubtitleDialog.service.busy
+                text: qsTr("取消")
+                ghost: true
+                onClicked: { onlineSubtitleDialog.searchStarted = false; onlineSubtitleDialog.service.cancel() }
+            }
+        }
+        Text {
+            objectName: "online-subtitle-error"
+            Layout.fillWidth: true
+            Layout.topMargin: 6
+            visible: onlineSubtitleDialog.service.error.length > 0
+            text: onlineSubtitleDialog.service.error
+            textFormat: Text.PlainText
+            color: Theme.warn
+            font.family: Theme.fontUi
+            font.pixelSize: Theme.fsSmall
+            wrapMode: Text.WordWrap
+        }
+        DNote {
+            objectName: "online-subtitle-empty"
+            visible: onlineSubtitleDialog.searchStarted && onlineSubtitleDialog.service.available && onlineSubtitleDialog.service.configured
+                     && !onlineSubtitleDialog.service.busy && onlineSubtitleDialog.service.error.length === 0
+                     && onlineSubtitleDialog.service.results.length === 0
+            text: qsTr("没有找到匹配字幕，可换用中文片名或减少版本信息后重试。")
+        }
+        DSection { visible: onlineSubtitleDialog.service.results.length > 0; text: qsTr("搜索结果") }
+        Repeater {
+            model: onlineSubtitleDialog.shown ? onlineSubtitleDialog.service.results : []
+            delegate: Rectangle {
+                id: resultRow
+                required property var modelData
+                required property int index
+                objectName: "online-subtitle-result-" + index
+                Layout.fillWidth: true
+                Layout.topMargin: 6
+                implicitHeight: resultContent.implicitHeight + 20
+                radius: 9
+                readonly property bool selected: modelData.title === onlineSubtitleDialog.service.selectedTitle
+                function choose() {
+                    if (onlineSubtitleDialog.service.available && !onlineSubtitleDialog.service.busy) onlineSubtitleDialog.service.chooseResult(index)
+                }
+                color: selected ? Theme.accentSoft : (resultHover.hovered ? Theme.card3 : Theme.card2)
+                border.width: 1
+                border.color: selected ? Theme.accent : Theme.stroke
+                HoverHandler { id: resultHover; enabled: !onlineSubtitleDialog.service.busy; cursorShape: Qt.PointingHandCursor }
+                TapHandler {
+                    enabled: onlineSubtitleDialog.service.available && !onlineSubtitleDialog.service.busy
+                    onTapped: resultRow.choose()
+                }
+                ColumnLayout {
+                    id: resultContent
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.leftMargin: 10
+                    anchors.rightMargin: 10
+                    spacing: 4
+                    Text {
+                        Layout.fillWidth: true
+                        text: resultRow.modelData.title || qsTr("未命名字幕")
+                        textFormat: Text.PlainText
+                        color: Theme.t1
+                        font.family: Theme.fontUi
+                        font.pixelSize: Theme.fsBody
+                        wrapMode: Text.WordWrap
+                    }
+                    Text {
+                        Layout.fillWidth: true
+                        text: [resultRow.modelData.language || "", resultRow.modelData.format || ""].filter(x => x.length > 0).join(" · ")
+                        textFormat: Text.PlainText
+                        color: Theme.t3
+                        font.family: Theme.fontUi
+                        font.pixelSize: Theme.fsSmall
+                        wrapMode: Text.WordWrap
+                    }
+                }
+            }
+        }
+        DSection { visible: onlineSubtitleDialog.service.files.length > 0; text: qsTr("选择字幕文件") }
+        Repeater {
+            model: onlineSubtitleDialog.shown ? onlineSubtitleDialog.service.files : []
+            delegate: Rectangle {
+                id: subtitleFileRow
+                required property var modelData
+                required property int index
+                objectName: "online-subtitle-file-" + index
+                Layout.fillWidth: true
+                Layout.topMargin: 6
+                implicitHeight: fileContent.implicitHeight + 20
+                radius: 9
+                color: Theme.card2
+                border.width: 1
+                border.color: Theme.stroke
+                RowLayout {
+                    id: fileContent
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.leftMargin: 10
+                    anchors.rightMargin: 10
+                    spacing: 8
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 3
+                        Text {
+                            Layout.fillWidth: true
+                            text: subtitleFileRow.modelData.name || qsTr("字幕文件")
+                            textFormat: Text.PlainText
+                            color: Theme.t1
+                            font.family: Theme.fontUi
+                            font.pixelSize: Theme.fsBody
+                            wrapMode: Text.WrapAnywhere
+                        }
+                        Text {
+                            Layout.fillWidth: true
+                            text: subtitleFileRow.modelData.supported
+                                  ? (Number(subtitleFileRow.modelData.size) > 0 ? Math.max(1, Math.round(Number(subtitleFileRow.modelData.size) / 1024)) + " KB" : qsTr("文本字幕"))
+                                  : qsTr("此文件格式暂不支持，请选择 SRT / ASS / SSA / VTT")
+                            color: subtitleFileRow.modelData.supported ? Theme.t3 : Theme.warn
+                            font.family: Theme.fontUi
+                            font.pixelSize: Theme.fsSmall
+                            wrapMode: Text.WordWrap
+                        }
+                    }
+                    VButton {
+                        objectName: "online-subtitle-download-" + subtitleFileRow.index
+                        text: qsTr("加载")
+                        primary: true
+                        enabled: subtitleFileRow.modelData.supported && onlineSubtitleDialog.service.available && !onlineSubtitleDialog.service.busy
+                        onClicked: onlineSubtitleDialog.service.downloadFile(subtitleFileRow.index)
+                    }
+                }
+            }
+        }
+        VButton {
+            objectName: "online-subtitle-attribution"
+            Layout.topMargin: 10
+            text: qsTr("字幕服务由 assrt.net 提供")
+            ghost: true
+            onClicked: Qt.openUrlExternally("https://assrt.net/")
+        }
+    }
+
     // --- 字幕设置 ---------------------------------------------------------
     DLayer {
         id: subtitleDialog
@@ -1307,7 +1779,11 @@ Item {
             VRow {
                 label: qsTr("外挂字幕")
                 hint: "SRT / ASS / SSA / WebVTT"
-                VButton { objectName: "subtitle-load"; text: qsTr("加载文件…"); onClicked: veyra.loadSubtitleDialog() }
+                RowLayout {
+                    spacing: 6
+                    VButton { objectName: "subtitle-online"; text: qsTr("在线搜索…"); enabled: host.onlineSubtitleService.available; onClicked: host.open("online-subtitle") }
+                    VButton { objectName: "subtitle-load"; text: qsTr("加载文件…"); onClicked: veyra.loadSubtitleDialog() }
+                }
             }
             VRow {
                 label: qsTr("默认显示副字幕")

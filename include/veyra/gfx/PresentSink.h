@@ -56,6 +56,7 @@ public:
         bool waitable = false;
         bool xess = false;
         bool captureCompatible = false;
+        bool previewOnly = false; // optional SDR secondary sink: no FG and no creation sleeps
         bool hdr = false;
         bool hdr10 = false;
         // Requested frame-generation multiplier (2 = one generated frame).
@@ -85,6 +86,10 @@ public:
     // Presents the current back buffer. Returns false on device-lost class
     // failures (caller must trigger recovery).
     bool present(Status& status);
+    enum class PreviewPresentResult { Presented,Busy,Occluded,Unavailable,Failed };
+    // Secondary preview only. Requires zero-time presentationReady capacity;
+    // never waits for DXGI capacity or invokes a frame-generation provider.
+    PreviewPresentResult tryPresentPreview(Status& status);
     struct PresentTiming {
         double beforeMs=0,callMs=0,bufferMs=0,afterMs=0;
         HRESULT result=S_OK;
@@ -124,6 +129,7 @@ public:
     // scaling fallback is active after a resize).
     uint32_t bufferWidth() const { return bufferExtentW_; }
     uint32_t bufferHeight() const { return bufferExtentH_; }
+    uint64_t outputGeneration() const { return outputGeneration_; }
     uint64_t presentCount() const { return presentCount_; }          // SUCCEEDED only
     uint64_t attemptedPresentCount() const { return attemptedPresentCount_; }
     uint64_t failedPresentCount() const { return failedPresentCount_; }
@@ -153,6 +159,7 @@ private:
     Desc desc_{};
     uint32_t width_ = 0;
     uint32_t height_ = 0;
+    uint64_t outputGeneration_ = 0;
     uint64_t presentCount_ = 0;
     uint64_t attemptedPresentCount_ = 0;
     bool presentContractDirty_=true;

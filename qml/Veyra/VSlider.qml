@@ -67,7 +67,12 @@ Item {
     // range so wide ranges still move. While focused the arrows belong to the slider, not
     // to the window's seek and volume shortcuts; Esc gives them back.
     activeFocusOnTab: enabledControl
-    readonly property real keyStep: Math.max(Number(typeof veyra !== "undefined" && veyra.preferences ? (veyra.preferences.sliderKeyStep || 0.1) : 0.1), (to - from) / 1000)
+    // Opt in only for parameters that need finer arrows than the shared step.
+    // Zero keeps every existing slider's preference/range-derived behavior.
+    property real keyboardStepOverride: 0
+    readonly property real keyStep: isFinite(keyboardStepOverride) && keyboardStepOverride > 0
+        ? keyboardStepOverride
+        : Math.max(Number(typeof veyra !== "undefined" && veyra.preferences ? (veyra.preferences.sliderKeyStep || 0.1) : 0.1), (to - from) / 1000)
     function nudge(direction) {
         const next = Math.max(from, Math.min(to, value + direction * keyStep))
         // Snap to the step grid so 0.1 steps do not drift into 0.30000000000000004.

@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Veyra 视频增强</title><link rel="stylesheet" href="popup.css"></head>
+<body><main>
+<div class="heading"><div><h1>视频增强</h1><p id="status" role="status">正在读取 Veyra 状态…</p></div>
+<label class="switch" aria-label="开启网页视频增强"><input id="enabled" type="checkbox" disabled><span></span></label></div>
+<p id="details" class="details"></p>
+<p class="hint">自动处理当前前台网页的主视频，网页布局和鼠标操作保持原样。切换应用或标签时恢复原画面。</p>
+<p id="error" class="error" hidden></p>
+<button id="retry" class="retry" type="button">重新连接</button>
+</main><script src="popup.js"></script></body></html>

@@ -8,13 +8,13 @@ Texture2D<float4> sourceTex : register(t0);
 
 cbuffer PresentBlitConstants : register(b0)
 {
-    float4 srcDims; // z flags: 1=sRGB encode, 2=fine, 4=PQ encode, 8=SDR white, 16=HDR curve, 32=PQ decode
+    float4 srcDims; // z flags: 1=sRGB encode, 2=fine, 4=PQ encode, 8=SDR white, 16=HDR curve, 32=PQ decode, 64=comparison guide
     float4 dstDims; // x/y=client extent z/w=view center
     // Custom: static HDR brightness curve, applied on absolute nits before the PQ
     // encode. See veyra/engine/HdrOutputTuning.h for the contract; every field is
     // a no-op at its default (lift 0, mid 203, start 0, cap 0).
     float4 curve0;  // x=shadow lift EV, y=shadow range nits, z=mid-gray nits, w=highlight start nits
-    float4 curve1;  // x=roll-off scale nits, y=peak cap nits (0 = off)
+    float4 curve1;  // x=roll-off scale nits, y=peak cap nits (0 = off); guide z=split, w=DPI scale
 };
 
 // Lift the shadows without touching the highlights, move the mid-gray reference
@@ -114,6 +114,29 @@ float4 psMain(VSOut input) : SV_Target
         if(any(uv<0)||any(uv>1))return float4(0,0,0,1);
     }
     uint flags=uint(srcDims.z+0.5);
+    if(flags&64) {
+        // Presentation-only comparison guide: no texture sampling, grading or
+        // writes to the video resource. Widths use current client pixels rather
+        // than the retained swapchain buffer, including during live resize.
+        const float scale=max(curve1.w,1.0);
+        const float fit=min(dstDims.x/srcDims.x,dstDims.y/srcDims.y)*srcDims.w;
+        const float boundary=dstDims.x*0.5+(curve1.z-dstDims.z)*srcDims.x*fit;
+        if(boundary<=0.0||boundary>=dstDims.x)discard;
+        const float2 delta=(uv-float2(curve1.z,0.5))*srcDims.xy*fit;
+        const float ax=abs(delta.x);
+        const float2 q=abs(delta)-float2(10.0,14.0)*scale+7.0*scale;
+        const float gripDistance=length(max(q,0.0))+min(max(q.x,q.y),0.0)-7.0*scale;
+        if(ax>=2.0*scale&&gripDistance>0.0)discard;
+        float shade=ax<scale?1.0:0.0; // white core with a dark edge
+        if(gripDistance<=0.0) {
+            shade=gripDistance<=-scale?1.0:0.0;
+            if(abs(ax-3.0*scale)<0.6*scale&&abs(delta.y)<4.0*scale)shade=0.0;
+        }
+        float3 guide=shade.xxx;
+        if(flags&8)guide*=203.0/80.0; // bounded SDR white in scRGB/HDR10
+        if(flags&4)guide=HdrEncodePq(guide);
+        return float4(guide,1.0);
+    }
     float4 color=(flags&2)?FineSample(uv):sourceTex.SampleLevel(linearClamp,uv,0);
     if(flags&32)color.rgb=HdrDecodePq(color.rgb);
     if(flags&8)color.rgb*=203.0/80.0; // SDR comparison white in an HDR output.

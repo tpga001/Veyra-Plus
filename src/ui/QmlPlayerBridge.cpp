@@ -1,4 +1,10 @@
+#include "veyra/capture/BrowserCaptureController.h"
+#include "veyra/ui/UiResponsivenessMonitor.h"
+#include "veyra/engine/NativePlaybackPresets.h"
+#include "veyra/engine/PlaybackDisplayPolicy.h"
 #include "veyra/ui/QmlPlayerBridge.h"
+#include "veyra/ui/OnlineSubtitleService.h"
+#include "veyra/ui/DisplayMonitor.h"
 #include "veyra/gfx/PresentSink.h"
 #include <QElapsedTimer>
 #include "veyra/ui/EffectAvailability.h"
@@ -31,6 +37,7 @@
 #include <QJsonArray>
 #include <QHash>
 #include <QFile>
+#include <QSaveFile>
 #include <QTimer>
 #include <QBuffer>
 #include <QImage>
@@ -119,6 +126,36 @@ namespace {
 QString utf8Of(std::string_view s) { return QString::fromUtf8(s.data(), int(s.size())); }
 QString utf8Of(const std::wstring& w) { return QString::fromWCharArray(w.c_str(), int(w.size())); }
 
+// Narrow diagnostic only: loader queries retain their handle and Win32 error.
+// The elapsed interval ends before logging can contend for the file-sink lock.
+HMODULE timedUiGetModuleHandleW(const wchar_t* fixedModuleName) {
+    const auto began = GetTickCount64();
+    const auto module = GetModuleHandleW(fixedModuleName);
+    const auto error = GetLastError();
+    const auto elapsed = GetTickCount64() - began;
+    if (elapsed > 100) {
+        veyra::log::warn("ui-module-probe", std::format("module={} elapsedMs={}",
+            QString::fromWCharArray(fixedModuleName).toStdString(), elapsed));
+    }
+    SetLastError(error);
+    return module;
+}
+class UiCallbackTimingProbe final {
+    const char* fixedName_;
+    ULONGLONG began_;
+public:
+    explicit UiCallbackTimingProbe(const char* fixedName)
+        : fixedName_(fixedName), began_(GetTickCount64()) {}
+    ~UiCallbackTimingProbe() {
+        const auto elapsed = GetTickCount64() - began_;
+        if (elapsed <= 100) return;
+        const auto error = GetLastError();
+        veyra::log::warn("ui-callback-probe", std::format("callback={} elapsedMs={}", fixedName_, elapsed));
+        SetLastError(error);
+    }
+};
+
+
 // Where crash and device-loss hints go: next to the log, where the crash handler in
 // apps/veyra-qml/main.cpp writes them too.
 QString lastFailurePath() {
@@ -169,11 +206,32 @@ struct QmlPlayerBridge::Impl {
     std::vector<bool> nrMasterRestore;
     QQmlEngine* qmlEngine = nullptr;
     engine::EngineController& engine;
+    std::unique_ptr<capture::BrowserCaptureController> browser;
+    bool browserHostAvailable = true;
+    std::function<bool(const QString&)> localFileLauncher;
+    std::unique_ptr<ui::DisplayMonitor> displayMonitor;
     PlayerUiFacade facade;
 
     // Last published snapshot and the revision it came from. Polling compares
     // revisions, so an unchanged snapshot costs one comparison per tick.
     engine::PlayerSnapshot snapshot;
+    engine::BrowserPreviewRequest browserPreviewRequest;
+    int browserPreviewComparisonMode = 0;
+    double browserPreviewComparisonSplit = 0.5;
+    // Explicitly admitted only for a presentation-only request change; it cannot
+    // carry a frame across window/session/visibility changes.
+    uint64_t browserPreviewRetainedRevision = 0;
+    const engine::PlayerSnapshot& readoutSnapshot() const {
+        if (browser && browser->enabled()) {
+            const auto view = browser->telemetry();
+            if (view.last && view.last->snapshot) return *view.last->snapshot;
+            // Selected browser may be waiting while a different source drains.
+            // It must never borrow that source's measurements.
+            static const engine::PlayerSnapshot unknown;
+            return unknown;
+        }
+        return snapshot;
+    }
     uint64_t publishedRevision = 0;
     bool haveSnapshot = false;
     bool openingSource = false;
@@ -295,7 +353,16 @@ struct QmlPlayerBridge::Impl {
     QVariantMap anchors;
     // Where the user's own files live (the facade resolves the same default).
     std::filesystem::path dataDir;
+    // Local and browser edit sessions have independent persistence. The
+    // controller flips enabled before emitting its signal, so do not infer
+    // the session being saved from BrowserCaptureController::enabled().
+    std::unique_ptr<engine::ChainSessionStore> browserSessionStore;
+    engine::ChainSession localSourceSession, browserSourceSession;
+    bool browserProfileActive = false, sourceProfilesReady = false;
+    std::optional<bool> admittedSourceProfile;
+    QString sourceProfileError;
     // --- subtitles (ported from the Win32 shell, same semantics) ---
+    std::unique_ptr<OnlineSubtitleService> onlineSubtitles;
     std::unique_ptr<engine::SubtitleLoader> subLoader;
     uint64_t subGeneration = 0;
     std::vector<engine::SubtitleTrack> subTracks;   // external files first, then the loader's
@@ -318,6 +385,11 @@ struct QmlPlayerBridge::Impl {
     // Declared after everything the worker touches, so it is joined first.
     std::jthread subAlignWorker;
     QVariantMap prefs;
+    pipeline::Extent playbackDisplay{},candidateDisplay{};
+    ULONGLONG displayCandidateSince=0;
+    bool sourceIsImage=false;
+    std::optional<engine::EnhancementSettings> lastDisplayAttempt;
+    uint64_t lastDisplayAttemptSession=0;
     QString lastScreenshot;
     bool holdKeyDown = false;
     int positionTicks = 0;
@@ -480,6 +552,7 @@ struct QmlPlayerBridge::Impl {
     Impl(engine::EngineController& e, std::filesystem::path dataDirectory)
         : engine(e), facade(e, dataDirectory),
           dataDir(dataDirectory.empty() ? runtime::localDataDirectory() : dataDirectory) {
+        browserSessionStore = std::make_unique<engine::ChainSessionStore>(dataDir / L"browser-chain-session.v1");
         if (!dataDirectory.empty()) anchorsFile = dataDirectory / L"node-anchors.json";
         if (!anchorsFile.empty()) {
             QFile file(QString::fromStdWString(anchorsFile.wstring()));
@@ -511,7 +584,7 @@ struct QmlPlayerBridge::Impl {
         session = engine::ChainSession::initial(facade.pendingSettings());
         savedSession = session;
         validation = engine::validateChain(chain);
-        options = engine::PlayerOptions::from(facade.pendingSettings());
+        options = playbackOptions(facade.pendingSettings());
     }
 
     std::optional<engine::EnhancementSettings> exportSettings(QString& error) const {
@@ -591,14 +664,183 @@ struct QmlPlayerBridge::Impl {
         return current;
     }
 
+    QString sourceProfileMarkerPath() const {
+        return QString::fromStdWString((dataDir / L"source-profiles.v1").wstring());
+    }
+    bool hasSourceProfileMarker() const { return QFileInfo::exists(sourceProfileMarkerPath()); }
+    bool sourceProfilesInitialized() const {
+        QFile file(sourceProfileMarkerPath());
+        return file.open(QIODevice::ReadOnly) && file.readAll() == QByteArray("VEYRA_SOURCE_PROFILES 1\n");
+    }
+    bool writeSourceProfileMarker() {
+        QSaveFile file(sourceProfileMarkerPath());
+        const QByteArray payload("VEYRA_SOURCE_PROFILES 1\n");
+        if (!file.open(QIODevice::WriteOnly) || file.write(payload) != payload.size() || !file.commit()) {
+            sourceProfileError = QObject::tr("片源配置迁移标记无法保存，保留原配置"); return false;
+        }
+        return true;
+    }
+    bool saveSourceSession(const engine::ChainSession& value, bool browserProfile) {
+        sourceProfileError.clear();
+        const bool saved = browserProfile ? browserSessionStore->save(value) : facade.saveChainSession(value);
+        if (!saved) sourceProfileError = uiText(browserProfile ? browserSessionStore->error() : facade.error());
+        return saved;
+    }
     bool persistSession() {
         const auto current = currentSession();
         if (current == savedSession) return true;
-        if (!facade.saveChainSession(current)) return false;
+        if (!saveSourceSession(current, browserProfileActive)) return false;
         session = savedSession = current;
+        (browserProfileActive ? browserSourceSession : localSourceSession) = current;
+        return true;
+    }
+    engine::EnhancementSettings sourceSettings(bool browserProfile) const {
+        auto result = facade.pendingSettings();
+        if (sourceProfilesReady) {
+            auto profile = std::make_unique<engine::ChainSession>(
+                browserProfile == browserProfileActive ? currentSession() :
+                browserProfile ? browserSourceSession : localSourceSession);
+            // Friendly presets describe List mode and preserve the independent
+            // Node editor; selecting one remains an explicit user action.
+            profile->configurations[size_t(engine::ChainMode::List)].apply(result);
+        }
+        return result;
+    }
+    bool initializeSourceProfiles() {
+        // Probe the browser store before touching local state. A corrupt file
+        // must never be silently replaced with a newly generated default.
+        auto local = std::make_unique<engine::ChainSession>(currentSession());
+        auto localSettings = facade.pendingSettings();
+        local->configurations[size_t(engine::ChainMode::List)].apply(localSettings);
+        auto browserSettings = engine::sourcePlaybackDefaults(localSettings, engine::PlaybackSourceProfile::Browser);
+        auto browserValue = std::make_unique<engine::ChainSession>(engine::ChainSession::initial(browserSettings));
+        if (!browserSessionStore->load(*browserValue)) {
+            sourceProfileError = uiText(browserSessionStore->error()); return false;
+        }
+        if (hasSourceProfileMarker() && !sourceProfilesInitialized()) {
+            sourceProfileError = QObject::tr("片源配置迁移标记损坏或无法读取，禁止覆盖"); return false;
+        }
+        const bool firstUse = !sourceProfilesInitialized();
+        auto oldLocal = std::make_unique<engine::ChainSession>(*local);
+        auto oldBrowser = std::make_unique<engine::ChainSession>(*browserValue);
+        if (firstUse) {
+            localSettings = engine::sourcePlaybackDefaults(localSettings, engine::PlaybackSourceProfile::LocalVideo);
+            local->configurations[size_t(engine::ChainMode::List)] =
+                engine::ChainConfiguration::capture(engine::toChain(localSettings), localSettings);
+            local->active = engine::ChainMode::List;
+            // Keep the local Node editor in its existing independent slot.
+            *browserValue = engine::ChainSession::initial(
+                engine::sourcePlaybackDefaults(localSettings, engine::PlaybackSourceProfile::Browser));
+        }
+        if (!local->valid() || !browserValue->valid()) {
+            sourceProfileError = QObject::tr("片源配置无效，保留已有配置"); return false;
+        }
+        // Save the separate browser file first: failures cannot overwrite the
+        // local file or mark migration complete.
+        if (!saveSourceSession(*browserValue, true)) return false;
+        if (firstUse && !saveSourceSession(*local, false)) {
+            const auto error = sourceProfileError;
+            saveSourceSession(*oldBrowser, true);
+            sourceProfileError = error; return false;
+        }
+        if (firstUse && !writeSourceProfileMarker()) {
+            const auto error = sourceProfileError;
+            const bool localRestored = saveSourceSession(*oldLocal, false);
+            const bool browserRestored = saveSourceSession(*oldBrowser, true);
+            sourceProfileError = error;
+            if (!localRestored || !browserRestored)
+                sourceProfileError += QObject::tr("；原配置回退未能全部保存");
+            return false;
+        }
+        auto pending = facade.pendingSettings();
+        local->configurations[size_t(local->active)].apply(pending);
+        if (!pending.validate().empty() ||
+            !applySettings(pending, engine::runtimeOrder(local->configurations[size_t(local->active)].chain))) {
+            sourceProfileError = QObject::tr("引擎未接受本地片源配置"); return false;
+        }
+        localSourceSession = *local; browserSourceSession = *browserValue;
+        session = savedSession = *local;
+        restoreConfiguration(local->configurations[size_t(local->active)]);
+        if (!revalidate()) return false;
+        sourceProfilesReady = true;
+        log::info("source-profiles", std::format("initialized firstUse={} localSr={} localBeauty={} browserSr={} browserBeauty={}",
+            firstUse, localSettings.videoSrQuality, localSettings.beauty.enabled,
+            browserSettings.videoSrQuality, browserSettings.beauty.enabled));
+        return true;
+    }
+    bool admitSourceProfile(bool browserProfile) {
+        admittedSourceProfile.reset();
+        if (browserProfileActive == browserProfile) return true;
+        if (!sourceProfilesReady) {
+            if (sourceProfileError.isEmpty()) sourceProfileError = QObject::tr("独立片源配置未准备好");
+            return false;
+        }
+        const auto& next = browserProfile ? browserSourceSession : localSourceSession;
+        auto pending = facade.pendingSettings();
+        next.configurations[size_t(next.active)].apply(pending);
+        if (!next.valid() || !pending.validate().empty()) {
+            sourceProfileError = QObject::tr("片源配置无效，保持当前播放"); return false;
+        }
+        auto leaving = std::make_unique<engine::ChainSession>(currentSession());
+        if (!saveSourceSession(*leaving, browserProfileActive)) return false;
+        (browserProfileActive ? browserSourceSession : localSourceSession) = *leaving;
+        admittedSourceProfile = browserProfile;
+        return true;
+    }
+    bool selectSourceProfile(bool browserProfile) {
+        if (browserProfileActive == browserProfile) return true;
+        if (!sourceProfilesReady) {
+            if (sourceProfileError.isEmpty()) sourceProfileError = QObject::tr("独立片源配置未准备好");
+            return false;
+        }
+        auto leaving = std::make_unique<engine::ChainSession>(currentSession());
+        const bool admitted = admittedSourceProfile && *admittedSourceProfile == browserProfile;
+        admittedSourceProfile.reset();
+        if (!admitted && !saveSourceSession(*leaving, browserProfileActive)) return false;
+        auto next = std::make_unique<engine::ChainSession>(
+            browserProfile ? browserSourceSession : localSourceSession);
+        auto pending = facade.pendingSettings();
+        next->configurations[size_t(next->active)].apply(pending);
+        if (!next->valid() || !pending.validate().empty() ||
+            !applySettings(pending, engine::runtimeOrder(next->configurations[size_t(next->active)].chain))) {
+            sourceProfileError = QObject::tr("引擎未接受片源配置，原参数保留"); return false;
+        }
+        (browserProfileActive ? browserSourceSession : localSourceSession) = *leaving;
+        browserProfileActive = browserProfile;
+        session = savedSession = *next;
+        restoreConfiguration(next->configurations[size_t(next->active)]);
+        revalidate();
+        options = playbackOptions(pending, engine::runtimeOrder(activeRuntime()));
+        log::info("source-profiles", std::format("active={} sr={} beauty={} fg={} nr={}",
+            browserProfile ? "browser" : "local", pending.videoSrQuality,
+            pending.beauty.enabled, pending.multiplier, pending.nr));
         return true;
     }
 
+    engine::EnhancementSettings playbackSettings(const engine::EnhancementSettings& manual,
+        std::optional<engine::ChainRuntimeOrder> order=std::nullopt) const {
+        return engine::displayPlaybackSettings(manual,playbackDisplay,
+            prefBool("srFollowDisplay",false),!order.has_value()&&!sourceIsImage);
+    }
+    engine::PlayerOptions playbackOptions(engine::EnhancementSettings manual,
+        std::optional<engine::ChainRuntimeOrder> order=std::nullopt) const {
+        return engine::PlayerOptions::from(playbackSettings(manual,order),order);
+    }
+    bool applySettings(const engine::EnhancementSettings& manual,
+        std::optional<engine::ChainRuntimeOrder> order=std::nullopt) {
+        if(browser&&browser->enabled()){
+            if(!manual.validate().empty())return false;
+            browser->configure(engine::PlayerOptions::from(manual,order),presentation);
+            facade.setPending(manual);
+            return true;
+        }
+        const auto effective=playbackSettings(manual,order);
+        if(!facade.applySettings(effective,order))return false;
+        // Preserve provider rollback tracking from the effective request, but never
+        // allow physical screen dimensions into saved user settings or exports.
+        facade.setPending(manual);
+        return true;
+    }
     bool poll() {
         const auto before=facade.pendingSettings();
         auto frame = facade.poll();
@@ -618,7 +860,7 @@ struct QmlPlayerBridge::Impl {
             restoreFg(chain);restoreFg(acceptedChain);
             if(draftGlobals.fgBackend==before.frameGenerationBackend)draftGlobals.fgBackend=restored.frameGenerationBackend;
             if(draftGlobals.vfgQuality==before.vfgQuality)draftGlobals.vfgQuality=restored.vfgQuality;
-            options=engine::PlayerOptions::from(restored,engine::runtimeOrder(acceptedChain));
+            options=playbackOptions(restored,engine::runtimeOrder(acceptedChain));
         }
         if (!frame.changed && haveSnapshot) return fgRollback||nrRollback;
         snapshot = frame.snapshot;
@@ -665,8 +907,8 @@ struct QmlPlayerBridge::Impl {
             veyra::log::warn("effect-availability", reason.toStdString());
             return false;
         }
-        if(!facade.applySettings(settings,engine::runtimeOrder(runtime)))return false;
-        options = engine::PlayerOptions::from(settings,engine::runtimeOrder(runtime));
+        if(!applySettings(settings,engine::runtimeOrder(runtime)))return false;
+        options = playbackOptions(settings,engine::runtimeOrder(runtime));
         return true;
     }
 
@@ -721,14 +963,14 @@ struct QmlPlayerBridge::Impl {
                 return false;
             }
         }
-        if(apply && changed && !facade.applySettings(s,order)){
+        if(apply && changed && !applySettings(s,order)){
             facade.setPending(previous);
             validation={false,"引擎未接受设置，已保留原状态"};
             return false;
         }
         if(!apply || !changed)facade.setPending(s);
         acceptedChain = *projected;
-        options = engine::PlayerOptions::from(s,order);
+        options = playbackOptions(s,order);
         return true;
     }
 #ifdef VEYRA_ENABLE_MOONLIGHT
@@ -875,7 +1117,7 @@ static QVariantMap scanEffectCapabilities() {
     add("nr3", H::NvidiaNr50, exists(nr / "nr-original/nvngx_dlssnr.dll"), QObject::tr("需要 NVIDIA RTX 50 / Blackwell"));
     add("nr4", H::AmdNr, exists(nr / "../amd-nr/LmxxfNrRuntime.dll"), QObject::tr("需要 AMD RX 9000"));
     wchar_t systemDir[MAX_PATH]{};
-    if (GetSystemDirectoryW(systemDir, MAX_PATH) && !exists(std::filesystem::path(systemDir) / "amdhip64_7.dll") && !GetModuleHandleW(L"amdhip64_7.dll")) {
+    if (GetSystemDirectoryW(systemDir, MAX_PATH) && !exists(std::filesystem::path(systemDir) / "amdhip64_7.dll") && !timedUiGetModuleHandleW(L"amdhip64_7.dll")) {
         auto cap = out.value("nr4").toMap();
         if (cap.value("available").toBool()) { cap["available"] = false; cap["reason"] = QObject::tr("需要 AMD HIP 7 驱动运行组件"); out["nr4"] = cap; }
     }
@@ -980,6 +1222,8 @@ static QString disableUnavailableEffects(engine::ChainConfiguration& configurati
 }
 QVariantMap QmlPlayerBridge::effectCapabilities() const { return currentEffectCapabilities(); }
 QVariantMap QmlPlayerBridge::effectAvailability(const QString& id) const {
+    if (id == QLatin1String("beauty") && isImage() && sourceKind() != QStringLiteral("browser"))
+        return {{QStringLiteral("available"), false}, {QStringLiteral("reason"), tr("暂不支持图片源")}};
     const auto& s = settings();
     const QString key = id == "nr" ? "nr" + QString::number(int(engine::currentNrRuntime(s.nrRuntime))) :
         id == "sr" ? "sr" + QString::number(s.videoSrQuality) : id == "video-hdr" ? QString("hdr") :
@@ -1010,16 +1254,50 @@ QVariantList QmlPlayerBridge::srBackendChoices() const {
 
 QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesystem::path dataDirectory,
                                 QObject* parent)
+
+    : QmlPlayerBridge(engine, std::move(dataDirectory), OnlineSubtitleFactory{}, parent) {}
+QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesystem::path dataDirectory,
+                               OnlineSubtitleFactory factory, QObject* parent)
+    : QmlPlayerBridge(engine, std::move(dataDirectory), std::move(factory), true, parent) {}
+QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesystem::path dataDirectory,
+                               OnlineSubtitleFactory factory, bool browserHost, QObject* parent)
     : QObject(parent), impl_(std::make_unique<Impl>(engine, std::move(dataDirectory))) {
+    impl_->browserHostAvailable = browserHost;
+    impl_->onlineSubtitles = factory ? factory(this->dataDirectory())
+                                    : std::make_unique<OnlineSubtitleService>(this->dataDirectory());
+    connect(impl_->onlineSubtitles.get(), &OnlineSubtitleService::subtitleReady, this, [this] {
+        auto& service = *impl_->onlineSubtitles;
+        auto track = service.takeReadyTrack();
+        // Source identity is checked again at the track boundary. Network and
+        // parsing completion never reuse a previous film's subtitle selection.
+        if (!track || sourceKind() != QStringLiteral("file") || isImage() ||
+            service.currentMedia() != QFileInfo(QString::fromStdWString(impl_->subMedia)).absoluteFilePath()) return;
+        impl_->subTracks.insert(impl_->subTracks.begin(), std::move(*track));
+        ++impl_->subExternal;
+        if (impl_->subPrimary >= 0) ++impl_->subPrimary;
+        if (impl_->subSecondary >= 0) ++impl_->subSecondary;
+        if (impl_->subAlignTrack >= 0) ++impl_->subAlignTrack;
+        impl_->subPrimary = 0;
+        impl_->subPrimaryChosen = true;
+        impl_->subStatus = tr("已加载在线字幕：%1").arg(QString::fromStdWString(impl_->subTracks.front().name));
+        emit subtitlesChanged();
+        emit notice(impl_->subStatus, false);
+    });
+
     connect(this,&QmlPlayerBridge::snapshotChanged,this,
         [this,ceiling=fgMaxMultiplier(),text=fgProviderText()]() mutable {
             const auto nextCeiling=fgMaxMultiplier();const auto nextText=fgProviderText();
             if(nextCeiling==ceiling&&nextText==text)return;
             ceiling=nextCeiling;text=nextText;emit fgChoicesChanged();
         });
+    // The computed name changes both when the active chain changes and when
+    // an otherwise unchanged chain is saved/renamed/imported/deleted.
+    connect(this,&QmlPlayerBridge::settingsChanged,this,&QmlPlayerBridge::currentPresetNameChanged);
+    connect(this,&QmlPlayerBridge::presetsChanged,this,&QmlPlayerBridge::currentPresetNameChanged);
     connect(this,&QmlPlayerBridge::settingsChanged,this,&QmlPlayerBridge::fgChoicesChanged);
     auto* capabilityTimer=new QTimer(this);
     connect(capabilityTimer,&QTimer::timeout,this,[this,reported=currentEffectCapabilities(),priorityRevision=uint64_t(-1)]() mutable {
+        const UiCallbackTimingProbe callbackTiming("capabilityTimer");
         if(gfx::gpuPriorityStatus().state==gfx::GpuPriorityState::Pending)gfx::applyRequestedGpuPriority();
         const auto priority=gfx::gpuPriorityStatus();
         if(priority.revision!=priorityRevision){priorityRevision=priority.revision;emit preferencesChanged();}
@@ -1031,6 +1309,9 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
     });
     capabilityTimer->start(2000);
     impl_->loadPrefs();
+    auto* displayTimer=new QTimer(this);
+    connect(displayTimer,&QTimer::timeout,this,[this]{refreshPlaybackDisplay();});
+    displayTimer->start(250);
     applyPreference(QStringLiteral("gpuPriority"));
     applyPreference(QStringLiteral("prewarmEnhancement"));
     impl_->engine.setFullscreenMemoryProtection(impl_->prefBool("fullscreenMemoryProtection",false));
@@ -1082,13 +1363,13 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
         const auto& configuration = restored.configurations[size_t(restored.active)];
         configuration.apply(settings);
         const auto previous = impl_->facade.pendingSettings();
-        if (settings.validate().empty() && impl_->facade.applySettings(settings,engine::runtimeOrder(configuration.chain))) {
+        if (settings.validate().empty() && impl_->applySettings(settings,engine::runtimeOrder(configuration.chain))) {
             impl_->session = restored;
             // Persist a repaired backend as well as the active mode. Otherwise
             // every restart reloads the unavailable DLSS value again.
             impl_->savedSession = savedConfiguration;
             impl_->restoreConfiguration(configuration);
-            impl_->options = engine::PlayerOptions::from(settings,engine::runtimeOrder(impl_->activeRuntime()));
+            impl_->options = impl_->playbackOptions(settings,engine::runtimeOrder(impl_->activeRuntime()));
             impl_->revalidate();
         } else {
             impl_->facade.setPending(previous);
@@ -1099,7 +1380,9 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
     if (!restoreError.isEmpty()) {
         veyra::log::error("ui-session", restoreError.toStdString());
         QTimer::singleShot(0, this, [this, restoreError] { emit notice(restoreError, true); });
-    } else if (presetsLoaded) {
+    } else if (presetsLoaded && !impl_->hasSourceProfileMarker()) {
+        // Once source profiles exist, an old global startup preset cannot
+        // overwrite manual local/browser choices on every application restart.
         const auto defaultIndex = impl_->facade.presets().defaultIndex();
         if (defaultIndex) {
             const auto before = impl_->currentSession();
@@ -1114,14 +1397,14 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
                 const auto disabled = disableUnavailableEffects(configuration);
                 configuration.apply(settings);
                 if (!disabled.isEmpty()) veyra::log::warn("effect-availability", "default preset disabled: " + disabled.toStdString());
-            if (!impl_->facade.applySettings(settings,
+            if (!impl_->applySettings(settings,
                                                     engine::runtimeOrder(candidate.configurations[size_t(candidate.active)].chain))) {
                 error = tr("引擎未接受默认预设，已保留恢复会话");
             } else {
                 impl_->session = candidate;
                 impl_->restoreConfiguration(candidate.configurations[size_t(candidate.active)]);
                 impl_->revalidate();
-                impl_->options = engine::PlayerOptions::from(settings, engine::runtimeOrder(impl_->activeRuntime()));
+                impl_->options = impl_->playbackOptions(settings, engine::runtimeOrder(impl_->activeRuntime()));
                 defaultFlowApplied = entry.flow.has_value() &&
                     (entry.contents & engine::presetContentMask(engine::PresetContent::Flow));
                 if (defaultFlowApplied) {
@@ -1170,6 +1453,11 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
         if (pr.valid()) impl_->engine.requestPresentation(pr);
         impl_->aspectMode = std::clamp(impl_->prefs.value(QStringLiteral("aspect")).toInt(), 0, 6);
     }
+    if (!impl_->initializeSourceProfiles()) {
+        const auto message = tr("独立片源配置未启用：") + impl_->sourceProfileError;
+        log::error("source-profiles", message.toStdString());
+        QTimer::singleShot(0, this, [this, message] { emit notice(message, true); });
+    }
     impl_->sessionSaveTimer = new QTimer(this);
     impl_->sessionSaveTimer->setSingleShot(true);
     impl_->sessionSaveTimer->setInterval(300);
@@ -1178,13 +1466,15 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
     connect(this, &QmlPlayerBridge::settingsChanged, this, scheduleSave);
     connect(impl_->sessionSaveTimer, &QTimer::timeout, this, [this] {
         if (!impl_->persistSession()) {
-            veyra::log::error("ui-session", utf8Of(impl_->facade.error()).toStdString());
-            emit notice(tr("当前修改尚未保存：") + uiText(impl_->facade.error()), true);
+            veyra::log::error("ui-session", impl_->sourceProfileError.toStdString());
+            emit notice(tr("当前修改尚未保存：") + impl_->sourceProfileError, true);
         }
     });
     // 60 Hz ceiling, and it does nothing at all when the snapshot is unchanged.
     impl_->timer = new QTimer(this);
     connect(impl_->timer, &QTimer::timeout, this, [this] {
+        struct UiTickEnd { ~UiTickEnd() { UiResponsivenessMonitor::setUiStage(0); } } uiTickEnd;
+        UiResponsivenessMonitor::setUiStage(1);
         const bool had = impl_->haveSnapshot;
         const uint64_t before = impl_->publishedRevision;
         const bool wasRunning = impl_->snapshot.running;
@@ -1193,7 +1483,10 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
         const bool wasFullscreenUnsafe = impl_->snapshot.vramFullscreenUnsafe;
         const auto wasTransport = impl_->snapshot.transport;
         const uint64_t wasSession = impl_->snapshot.sessionId;
-        if(impl_->poll()){emit settingsChanged();emit chainChanged();}
+        const auto previousBrowserPreview = impl_->snapshot.browserPreview;
+        const bool settingsUpdated = impl_->poll();
+        UiResponsivenessMonitor::setUiStage(5);
+        if (settingsUpdated) { emit settingsChanged(); emit chainChanged(); }
         if (impl_->snapshot.vramRunawayMiB && (impl_->vramNoticeSession != impl_->snapshot.sessionId ||
             (!wasFullscreenUnsafe && impl_->snapshot.vramFullscreenUnsafe))) {
             impl_->vramNoticeSession = impl_->snapshot.sessionId;
@@ -1204,12 +1497,15 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
             else emit notice(tr("显存在设置未变时增加了 %1 GB，正在尝试回收；回收结果见诊断日志。原因尚未确认。")
                                  .arg(impl_->snapshot.vramRunawayMiB / 1024.0, 0, 'f', 1), true);
         }
+        UiResponsivenessMonitor::setUiStage(2);
         tickSubtitles();
         tickImageBatch();
+        UiResponsivenessMonitor::setUiStage(3);
         tickCapture();
         tickPs5();
         tickMoonlight();
         tickXbox();
+        UiResponsivenessMonitor::setUiStage(4);
         // Geometry uses the source DAR and the same transform as mouse/compare.
         if (impl_->snapshot.running && impl_->videoWindow) {
             const bool fresh = impl_->aspectSession != impl_->snapshot.sessionId;
@@ -1257,6 +1553,7 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
                 if (fellBack) emit notice(tr("所选音频设备不可用，已切到系统默认设备"), true);
             }
         }
+        UiResponsivenessMonitor::setUiStage(5);
         if (!had || impl_->publishedRevision != before) {
             const auto& s = impl_->snapshot;
             if (!had || wasSession != s.sessionId || wasTransport != s.transport ||
@@ -1288,6 +1585,8 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
                 if (impl_->currentPage == QLatin1String("min")) emit navigate(QStringLiteral("home"));
             }
             emit snapshotChanged();
+            if (!had || impl_->snapshot.browserPreview != previousBrowserPreview)
+                emit browserPreviewChanged();
         }
         // An export in flight needs its own poll; it is a separate job and its
         // snapshot is not part of the player snapshot.
@@ -1300,6 +1599,7 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
     // they broke in the field. Log each once (every 2 s for two minutes, then every 10 s).
     auto* hookTimer = new QTimer(this);
     connect(hookTimer, &QTimer::timeout, this, [this, hookTimer, started = GetTickCount64()] {
+        const UiCallbackTimingProbe callbackTiming("hookTimer");
         struct Seen { const wchar_t* module; const char* product; };
         static const Seen others[] = {
             {L"graphics-hook64.dll", "OBS game capture"}, {L"DiscordHook64.dll", "Discord overlay"},
@@ -1308,7 +1608,7 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
         };
         static bool loggedOthers[std::size(others)]{};
         for (size_t k = 0; k < std::size(others); ++k)
-            if (!loggedOthers[k] && GetModuleHandleW(others[k].module)) {
+            if (!loggedOthers[k] && timedUiGetModuleHandleW(others[k].module)) {
                 loggedOthers[k] = true;
                 veyra::log::info("overlay-hooks", std::format("{} is injected into this process", others[k].product));
             }
@@ -1321,9 +1621,9 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
             handled = true;
             veyra::log::warn("overlay-hooks", std::format("{} is injected into this process ({})",
                 hook->product, QString::fromWCharArray(hook->module).toStdString()));
-            if (GetModuleHandleW(L"RTSSHooks64.dll")) {
+            if (timedUiGetModuleHandleW(L"RTSSHooks64.dll")) {
                 wchar_t path[32768]{};
-                GetModuleFileNameW(GetModuleHandleW(L"RTSSHooks64.dll"), path, DWORD(std::size(path)));
+                GetModuleFileNameW(timedUiGetModuleHandleW(L"RTSSHooks64.dll"), path, DWORD(std::size(path)));
                 veyra::log::info("overlay-hooks", std::format("RTSS hook module: activeServer={} path={}",
                     gfx::rivaTunerRunning(), QString::fromWCharArray(path).toStdString()));
             }
@@ -1334,7 +1634,7 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
         // OSD on the video.
         static bool rivaTunerLate = false;
         if (!rivaTunerLate && !qApp->property("veyraSoftwareUi").toBool() && !qApp->property("veyraUiRendererForced").toBool()
-                && GetModuleHandleW(L"RTSSHooks64.dll") && gfx::rivaTunerRunning()) {
+                && timedUiGetModuleHandleW(L"RTSSHooks64.dll") && gfx::rivaTunerRunning()) {
             rivaTunerLate = true;
             const bool automatic = impl_->prefString("overlayCompat") != QLatin1String("off");
             veyra::log::warn("overlay-hooks", std::format("RivaTuner injected into a run with a GPU interface; its OSD is off in this process ({})",
@@ -1346,7 +1646,7 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
         // RTSS version corrected against the executable on 2026-10-04); its
         // "Use Microsoft Detours API hooking" option lets both work. Said once, ever.
         static bool obsWithRivaTuner = false;
-        if (!obsWithRivaTuner && GetModuleHandleW(L"graphics-hook64.dll") && GetModuleHandleW(L"RTSSHooks64.dll")) {
+        if (!obsWithRivaTuner && timedUiGetModuleHandleW(L"graphics-hook64.dll") && timedUiGetModuleHandleW(L"RTSSHooks64.dll")) {
             obsWithRivaTuner = true;
             veyra::log::warn("overlay-hooks", "OBS game capture and RivaTuner are both injected: OBS may not get the picture unless RTSS uses Detours hooking for Veyra");
             if (!impl_->prefs.value(QStringLiteral("obsRivaTunerHintShown")).toBool()) {
@@ -1383,11 +1683,92 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
             : tr("上次采集时显卡设备丢失");
         emit notice(head + QStringLiteral("；") + advice, true);
     });
+    // Browser capture is part of this application and uses the same engine.
+    // Metadata never enables it; a foreground/safety failure leaves the browser original.
+    if (browserHost) {
+    impl_->browser=std::make_unique<capture::BrowserCaptureController>(impl_->engine,this);
+    impl_->browser->setRtxSourceSized(impl_->prefBool("browserRtxSourceSized",true));
+    impl_->browser->setEnableAdmission([this](bool enabled) {
+        if (impl_->admitSourceProfile(enabled)) return true;
+        emit notice(tr("无法切换片源方案：") + impl_->sourceProfileError, true);
+        return false;
+    });
+    connect(impl_->browser.get(),&capture::BrowserCaptureController::changed,this,[this]{
+        emit browserChanged();
+        emit browserPreviewChanged();
+        // Browser identity/metadata can change while the engine is stopped;
+        // source names and format text are existing snapshot-bound properties.
+        emit snapshotChanged();
+    });
+    connect(impl_->browser.get(),&capture::BrowserCaptureController::userEnabledRequested,
+        this,&QmlPlayerBridge::browserUserPreferenceChanged);
+    connect(impl_->browser.get(),&capture::BrowserCaptureController::enabledChanged,this,[this](bool enabled){
+        // The browser primary output must keep frame generation active. Preserve the
+        // local player's UI choices and restore them only when leaving browser mode.
+        impl_->holdKeyDown = false;
+        impl_->engine.comparison(enabled ? 0 : impl_->compareMode,
+                                  enabled ? false : impl_->compareBase,
+                                  float(impl_->compareSplit));
+        if(enabled){
+            rememberPosition(true);
+            ++impl_->liveOpenGen;impl_->pendingLiveText.clear();
+            impl_->openingSource=false;impl_->openingSessionId=0;impl_->resumeSession=0;
+            impl_->engine.stop();
+            refreshSubtitles({});
+            impl_->sourceIsImage=false;
+            impl_->sourceLabel.clear();
+            impl_->liveKind=QStringLiteral("browser");
+            impl_->liveLabel=tr("浏览器视频");
+            if (!impl_->selectSourceProfile(true)) {
+                emit notice(tr("无法切换浏览器方案：") + impl_->sourceProfileError, true);
+                impl_->browser->setEnabled(false);
+                return;
+            }
+            emit chainChanged(); emit settingsChanged();
+            impl_->browser->configure(engine::PlayerOptions::from(settings(),engine::runtimeOrder(impl_->activeRuntime())),impl_->presentation);
+        }else {
+            if (!impl_->selectSourceProfile(false)) {
+                emit notice(tr("无法恢复本地方案：") + impl_->sourceProfileError, true);
+                return;
+            }
+            if (impl_->liveKind==QLatin1String("browser")) {
+                impl_->liveKind.clear();impl_->liveLabel.clear();
+            }
+            emit chainChanged(); emit settingsChanged();
+        }
+        emit browserChanged();emit snapshotChanged();
+    });
+    if(!impl_->browser->startListening())
+        veyra::log::warn("browser-capture","local listener unavailable; native player remains usable");
+    }
     // Unsupported saved FG choices were repaired together with both modes
     // above, using actual provider availability rather than a brand alone.
 }
 
+VideoOutputSource QmlPlayerBridge::videoOutputSource() const {
+    VideoOutputSource out;
+    const bool browser = impl_->browser && impl_->browser->enabled();
+    const auto& s = impl_->readoutSnapshot();
+    out.sourceKind = browser ? "browser" : (s.sessionId ? "local" : "none");
+    out.available = s.sessionId && !s.image && s.outputSwapchainAddress;
+    out.playing = out.available && (browser ? impl_->browser->telemetry().live :
+        s.running && s.transport == engine::TransportState::Playing);
+    out.target.pid = GetCurrentProcessId(); out.target.sessionId = s.sessionId;
+    out.target.epoch = s.metrics.flow.latest.frame.epoch; out.target.revision = s.applied.revision;
+    out.target.outputSwapChain = s.outputSwapchainAddress; out.target.generation = s.outputGeneration;
+    out.target.application = "veyra_qml_ui.exe";
+    out.frameGenerationActive = s.fgActive;
+    if (s.fgActive) out.frameGenerationBackend = fgBackendName().toStdString();
+    if (s.fgActive && s.applied.frameGenerationBackend == engine::FrameGenerationBackend::XeSS)
+        out.expectedGeneratedFrameType = "Intel XeSS-FG";
+    out.videoHwnd = reinterpret_cast<uintptr_t>(impl_->videoWindow ? GetAncestor(impl_->videoWindow, GA_ROOT) : nullptr);
+    out.sourceHwnd = reinterpret_cast<uintptr_t>(browser ? impl_->browser->sourceWindow() : nullptr);
+    return out;
+}
+
 QmlPlayerBridge::~QmlPlayerBridge() {
+    setBrowserPreviewTarget(0, false);
+    if(impl_->browser)impl_->browser->setEnabled(false);
     if (qApp) qApp->removeEventFilter(this);
     rememberPosition(true);
     if (impl_->sessionSaveTimer) impl_->sessionSaveTimer->stop();
@@ -1396,12 +1777,142 @@ QmlPlayerBridge::~QmlPlayerBridge() {
 }
 
 
+bool QmlPlayerBridge::browserEnabled() const { return impl_->browser&&impl_->browser->enabled(); }
+bool QmlPlayerBridge::browserListening() const { return impl_->browser&&impl_->browser->listenerRunning(); }
+QString QmlPlayerBridge::browserStatus() const { return impl_->browser?impl_->browser->status():tr("未启动"); }
+QVariantMap QmlPlayerBridge::browserDiagnostics() const { return impl_->browser?impl_->browser->diagnostics():QVariantMap{}; }
+QVariantMap QmlPlayerBridge::browserTelemetry() const {
+    const auto view = impl_->browser ? impl_->browser->telemetry() : capture::BrowserTelemetryView{};
+    const auto& source = view.source;
+    const auto* sample = view.last ? &*view.last : nullptr;
+    const bool originalFpsKnown = source.available && std::isfinite(source.originalFps) && source.originalFps > 0;
+    QVariantMap result{
+        {"state", browserEnabled() ? (view.live ? "running" : "waiting") : "stopped"},
+        {"status", browserStatus()}, {"live", view.live}, {"hasLastSample", bool(sample)},
+        {"sampleAgeMs", QVariant::fromValue<qulonglong>(view.sampleAgeMs)},
+        {"originalWidth", int(source.originalWidth)}, {"originalHeight", int(source.originalHeight)},
+        {"originalFps", originalFpsKnown ? source.originalFps : 0}, {"originalFpsKnown", originalFpsKnown},
+        {"captureWidth", sample ? int(sample->captureWidth) : 0}, {"captureHeight", sample ? int(sample->captureHeight) : 0},
+        // WGC currently publishes counts and ingress CPU duration, no sampled
+        // capture rate. Neither monitor refresh nor rVFC is that measurement.
+        {"captureFps", 0.0}, {"captureFpsKnown", false},
+        {"videoSrInputWidth", sample && sample->snapshot && sample->srActive ? int(sample->snapshot->videoSrInputExtent.width) : 0},
+        {"videoSrInputHeight", sample && sample->snapshot && sample->srActive ? int(sample->snapshot->videoSrInputExtent.height) : 0},
+        {"targetWidth", sample ? int(sample->targetWidth) : 0}, {"targetHeight", sample ? int(sample->targetHeight) : 0},
+        {"displayWidth", int(source.displayWidth)}, {"displayHeight", int(source.displayHeight)},
+        {"videoWidth", int(source.videoWidth)}, {"videoHeight", int(source.videoHeight)},
+        {"session", QVariant::fromValue<qulonglong>(sample ? sample->session : 0)},
+        {"epoch", QVariant::fromValue<qulonglong>(sample ? sample->epoch : 0)},
+        {"revision", QVariant::fromValue<qulonglong>(sample ? sample->revision : 0)},
+        {"nrActive", view.live && sample && sample->nrActive}, {"srActive", view.live && sample && sample->srActive},
+        {"fgActive", view.live && sample && sample->fgActive},
+        {"lastNrActive", sample && sample->nrActive}, {"lastSrActive", sample && sample->srActive}, {"lastFgActive", sample && sample->fgActive},
+        {"submitFps", sample ? sample->submitFps.value_or(0) : 0}, {"submitFpsKnown", sample && sample->submitFps.has_value()},
+        {"submitFpsLabel", sample && sample->sdkSubmit ? tr("SDK 提交") : tr("提交")},
+        {"submissionIsDisplayFps", false}, {"inputClock", "compositor"}, {"audioCapture", false}};
+    return result;
+}
+QVariantMap QmlPlayerBridge::browserPreview() const {
+    // Preview readiness must never come from the frozen chain-readout cache.
+    const auto& preview = impl_->snapshot.browserPreview;
+    const auto& requested = impl_->browserPreviewRequest;
+    const uint64_t ownedSession = impl_->browser ? impl_->browser->previewSessionId() : 0;
+    const bool matches = requested.visible && requested.window && ownedSession &&
+        requested.sessionId == ownedSession && preview.window == requested.window &&
+        preview.sessionId == requested.sessionId &&
+        (preview.revision == requested.revision || preview.revision == impl_->browserPreviewRetainedRevision);
+    const bool presentationPending = matches && preview.hasFrame &&
+        preview.frameRequestRevision != requested.revision;
+    const auto stateName = [](engine::BrowserPreviewState state) {
+        switch (state) {
+        case engine::BrowserPreviewState::Disabled: return "disabled";
+        case engine::BrowserPreviewState::Waiting: return "waiting";
+        case engine::BrowserPreviewState::Ready: return "ready";
+        case engine::BrowserPreviewState::Frozen: return "frozen";
+        case engine::BrowserPreviewState::Busy: return "busy";
+        case engine::BrowserPreviewState::Unsupported: return "unsupported";
+        case engine::BrowserPreviewState::Unavailable: return "unavailable";
+        case engine::BrowserPreviewState::Failed: return "failed";
+        }
+        return "waiting";
+    };
+    return {
+        {"state", presentationPending ? "waiting" : matches ? stateName(preview.state) : requested.visible ? "waiting" : "disabled"},
+        {"status", presentationPending ? tr("正在切换对照预览") : matches ? QString::fromStdWString(preview.status)
+            : requested.visible ? tr("等待增强预览") : tr("预览未开启")},
+        {"hasFrame", matches && preview.hasFrame}, {"live", matches && preview.live && !presentationPending},
+        {"visible", requested.visible},
+        {"failed", matches && preview.failed},
+        {"window", QVariant::fromValue<qulonglong>(requested.window)},
+        {"sessionId", QVariant::fromValue<qulonglong>(matches ? preview.sessionId : ownedSession)},
+        {"revision", QVariant::fromValue<qulonglong>(requested.revision)},
+        {"submitted", QVariant::fromValue<qulonglong>(matches ? preview.submitted : 0)},
+        {"gpuCompleted", QVariant::fromValue<qulonglong>(matches ? preview.gpuCompleted : 0)},
+        {"skippedBusy", QVariant::fromValue<qulonglong>(matches ? preview.skippedBusy : 0)},
+        {"width", matches ? int(preview.width) : 0}, {"height", matches ? int(preview.height) : 0},
+        {"sourceFrameId", QVariant::fromValue<qulonglong>(matches ? preview.sourceFrameId : 0)},
+        {"epoch", QVariant::fromValue<qulonglong>(matches ? preview.epoch : 0)},
+        {"settingsRevision", QVariant::fromValue<qulonglong>(matches ? preview.settingsRevision : 0)},
+        {"includesXeSSGeneratedFrames", false},
+        {"requestedComparisonMode", impl_->browserPreviewComparisonMode},
+        {"requestedComparisonSplit", impl_->browserPreviewComparisonSplit},
+        {"comparisonMode", matches ? preview.comparisonMode : 0},
+        {"comparisonSplit", matches ? double(preview.comparisonSplit) : 0.5},
+        {"referenceAvailable", matches && preview.hasFrame && preview.referenceAvailable},
+        {"frameRequestRevision", QVariant::fromValue<qulonglong>(matches ? preview.frameRequestRevision : 0)},
+        // An old same-source frame may remain on screen while a newer mode or split
+        // is pending. Never describe that old frame as the newly requested comparison.
+        {"comparisonPending", matches && preview.hasFrame &&
+            (preview.frameRequestRevision != requested.revision ||
+             preview.comparisonMode != requested.comparisonMode ||
+             std::abs(preview.comparisonSplit - requested.comparisonSplit) > 0.0001f ||
+             (requested.comparisonMode != 0 && !preview.referenceAvailable))}
+    };
+}
+int QmlPlayerBridge::browserPreviewComparisonMode() const { return impl_->browserPreviewComparisonMode; }
+void QmlPlayerBridge::setBrowserPreviewComparisonMode(int mode) {
+    if (mode < 0 || mode > 2 || impl_->browserPreviewComparisonMode == mode) return;
+    impl_->browserPreviewComparisonMode = mode;
+    const auto target = impl_->browserPreviewRequest;
+    setBrowserPreviewTarget(qulonglong(target.window), target.visible);
+}
+double QmlPlayerBridge::browserPreviewComparisonSplit() const { return impl_->browserPreviewComparisonSplit; }
+void QmlPlayerBridge::setBrowserPreviewComparisonSplit(double split) {
+    if (!std::isfinite(split)) return;
+    split = std::clamp(split, 0.0, 1.0);
+    if (std::abs(impl_->browserPreviewComparisonSplit - split) < 0.000001) return;
+    impl_->browserPreviewComparisonSplit = split;
+    const auto target = impl_->browserPreviewRequest;
+    setBrowserPreviewTarget(qulonglong(target.window), target.visible);
+}
+bool QmlPlayerBridge::browserHostAvailable() const { return impl_->browserHostAvailable; }
+void QmlPlayerBridge::setLocalFileLauncher(std::function<bool(const QString&)> launcher) {
+    impl_->localFileLauncher = std::move(launcher);
+}
+void QmlPlayerBridge::launchLocalFile(const QString& path) {
+    if (path.isEmpty()) return;
+    if (impl_->localFileLauncher) { impl_->localFileLauncher(path); return; }
+    openPath(path); // isolated bridge clients/tests without a desktop host
+}
+void QmlPlayerBridge::setBrowserEnabled(bool enabled) {
+    if (!impl_->browser) { if (enabled) emit residentBrowserRequested(); return; }
+    if(impl_->browser)impl_->browser->setEnabledFromUser(enabled);
+}
+void QmlPlayerBridge::applyBrowserEnabled(bool enabled) {
+    if(impl_->browser)impl_->browser->setEnabled(enabled);
+}
+void QmlPlayerBridge::openBrowserExtensionFolder() {
+    const auto folder=QCoreApplication::applicationDirPath()+QStringLiteral("/browser-extension");
+    if(!QFileInfo::exists(folder)){emit notice(tr("当前目录缺少浏览器扩展"),true);return;}
+    QDesktopServices::openUrl(QUrl::fromLocalFile(folder));
+}
+
 // --- professional-page readouts ---------------------------------------------
 // These read fields the engine genuinely publishes. Where it publishes nothing,
 // the getter says so and the UI shows an explicit "unmeasured" rather than a
 // zero or a stand-in.
 QString QmlPlayerBridge::outputSummary() const {
-    const auto& s = impl_->snapshot;
+    const auto& s = impl_->readoutSnapshot();
     const auto& plan = s.metrics.resolution;
     if (!s.running || !plan.output.valid() || plan.settingsRevision != s.applied.revision) return {};
     return QStringLiteral("%1x%2").arg(plan.output.width).arg(plan.output.height);
@@ -1411,28 +1922,30 @@ QString QmlPlayerBridge::outputSummary() const {
 // counter is wired in this build, so it reports unknown and the UI shows "未测" -
 // which is exactly what the design requires instead of passing the submit rate off
 // as a measurement that was never taken.
-double QmlPlayerBridge::displayFps() const { return 0.0; }
-bool QmlPlayerBridge::displayFpsKnown() const { return false; }
+double QmlPlayerBridge::displayFps() const { return impl_->displayMonitor?impl_->displayMonitor->fps():0.0; }
+bool QmlPlayerBridge::displayFpsKnown() const { return impl_->displayMonitor&&impl_->displayMonitor->known(); }
+QVariantMap QmlPlayerBridge::displayMetrics() const {return impl_->displayMonitor?impl_->displayMonitor->metrics():QVariantMap{};}
+void QmlPlayerBridge::authorizeDisplayMonitor(){if(impl_->displayMonitor)impl_->displayMonitor->authorize();}
 
 double QmlPlayerBridge::queuedFrames() const {
     // Valid output opportunities held by presenter jobs, not cumulative skips
     // and not the OS/display queue. Zero is meaningful only with a live window.
-    return queuedFramesKnown() ? double(impl_->snapshot.metrics.flow.pendingOutputFrames) : 0.0;
+    return queuedFramesKnown() ? double(impl_->readoutSnapshot().metrics.flow.pendingOutputFrames) : 0.0;
 }
 bool QmlPlayerBridge::queuedFramesKnown() const {
-    const auto& s = impl_->snapshot;
+    const auto& s = impl_->readoutSnapshot();
     const auto& flow = s.metrics.flow;
     return s.running && !s.image && s.sessionId != 0 &&
         flow.latest.sessionId == s.sessionId && flow.lastReady100ns > 0 &&
         flow.latest.frame.settingsRevision == s.applied.revision;
 }
 
-int QmlPlayerBridge::skippedFrames() const { return int(impl_->snapshot.previewSkipped); }
+int QmlPlayerBridge::skippedFrames() const { return int(impl_->readoutSnapshot().previewSkipped); }
 
 QString QmlPlayerBridge::flowBackend() const {
     // The snapshot carries a performance figure and a content rate, not a backend
     // name; report the fact we do have and let it read as unmeasured otherwise.
-    const auto& s = impl_->snapshot;
+    const auto& s = impl_->readoutSnapshot();
     if (s.flowPerf == 0) return {};
     return QStringLiteral("GPU 光流");
 }
@@ -1455,7 +1968,7 @@ QVariantList QmlPlayerBridge::stageTimings() const {
     // Consume the existing GPU timestamp aggregates. Repeated NR layers share
     // a timestamp slot: this is stage sampling, NOT per-node attribution.
     // XeSS-internal FG is not measured by the graph's DLSS FG batch query.
-    const auto& s = impl_->snapshot;
+    const auto& s = impl_->readoutSnapshot();
     QVariantList out;
     using Stage = diagnostics::GpuStage;
     struct Row { const char* label; Stage stage; const char* color; };
@@ -1466,6 +1979,7 @@ QVariantList QmlPlayerBridge::stageTimings() const {
         {"NR采样", Stage::Nr, "#FF8A3D"},
         {"残差", Stage::Residual, "#E7B868"},
         {"FG", Stage::FgBatch, "#3DDC84"},
+        {"美颜", Stage::Beauty, "#E4A2B4"},
         {"HDR", Stage::VideoHdr, "#E58BD9"},
         {"呈现", Stage::Blit, "#58CAD4"},
     };
@@ -1490,7 +2004,8 @@ QVariantList QmlPlayerBridge::stageTimings() const {
         const auto& sample = s.metrics.flow.gpuTiming[size_t(r.stage)];
         // The mean of the last second, as 1.4.4's dashboard showed; P95 rides along for the
         // tooltip. Showing P95 alone read as "slower than 1.4.4" for the same work.
-        const bool measured = queuedFramesKnown() && sample.samples > 0 &&
+        const bool measured = queuedFramesKnown() &&
+            (r.stage != Stage::Beauty || beautyMetrics().value(QStringLiteral("measured")).toBool()) && sample.samples > 0 &&
             sample.mean && std::isfinite(*sample.mean) && *sample.mean >= 0.0;
         const double ms = measured ? *sample.mean : 0.0;
         QVariantMap item;
@@ -1499,7 +2014,7 @@ QVariantList QmlPlayerBridge::stageTimings() const {
         item["p95"] = measured && sample.p95 ? *sample.p95 : 0.0;
         item["measured"] = measured;
         item["samples"] = measured ? QVariant::fromValue<qulonglong>(sample.samples) : QVariant::fromValue<qulonglong>(0);
-        item["domain"] = QStringLiteral("GPU timestamp P95");
+        item["domain"] = QStringLiteral("GPU timestamp mean");
         item["color"] = QString::fromUtf8(r.color);
         item["fraction"] = (measured && budget > 0.01) ? ms / budget : 0.0;
         out << item;
@@ -1513,7 +2028,8 @@ QVariantMap QmlPlayerBridge::nodeTimings() const {
     // chain actually running; drafts, detached and disabled nodes never do.
     using Stage = diagnostics::GpuStage;
     const auto& c = impl_->chain;
-    const auto& flow = impl_->snapshot.metrics.flow;
+    const auto& readout = impl_->readoutSnapshot();
+    const auto& flow = readout.metrics.flow;
     const bool node = c.mode == engine::ChainMode::Node;
     std::vector<int> path;
     bool draft = false;
@@ -1571,10 +2087,19 @@ QVariantMap QmlPlayerBridge::nodeTimings() const {
             ++colour;
             break;
         case engine::EffectType::SuperResolution: stage = Stage::Sr; break;
+        case engine::EffectType::Beauty: {
+            const auto beauty = beautyMetrics();
+            if (beauty.value(QStringLiteral("measured")).toBool()) stage = Stage::Beauty;
+            else if (beauty.value(QStringLiteral("state")).toString() == QLatin1String("bypass"))
+                waiting = QStringLiteral("beauty-bypass");
+            else if (beauty.value(QStringLiteral("state")).toString() == QLatin1String("unsupported"))
+                waiting = QStringLiteral("beauty-unsupported");
+            break;
+        }
         case engine::EffectType::VideoHdr:
             stage = Stage::VideoHdr;
             // SDR display path: the node is wired but TrueHDR is not built.
-            if (live && !impl_->snapshot.videoHdrActive) waiting = QStringLiteral("hdr-sdr");
+            if (live && !readout.videoHdrActive) waiting = QStringLiteral("hdr-sdr");
             break;
         case engine::EffectType::FrameGeneration:
             if (xess) waiting = QStringLiteral("sdk"); else stage = Stage::FgBatch;
@@ -1596,20 +2121,21 @@ double QmlPlayerBridge::stageBudgetMs() const {
     // With 60->30 capture half rate only every other frame is enhanced, so each has two
     // source periods; dividing by one read 19 ms of 8K work as 115-130 % while it kept up
     // (logs8, 2026-10-01).
-    const double fps = impl_->snapshot.nominalSourceFps * (impl_->snapshot.captureHalfRate ? 0.5 : 1.0);
+    const auto& s = impl_->readoutSnapshot();
+    const double fps = s.nominalSourceFps * (s.captureHalfRate ? 0.5 : 1.0);
     return fps > 0.01 ? 1000.0 / fps : 0.0;
 }
 
-double QmlPlayerBridge::scheduleP95Ms() const { return impl_->snapshot.schedulingWaitP95Ms; }
+double QmlPlayerBridge::scheduleP95Ms() const { return impl_->readoutSnapshot().schedulingWaitP95Ms; }
 
 double QmlPlayerBridge::chainTotalMs() const {
     // Engine merges same-frame measured intervals before aggregation. Never
     // sum unrelated percentiles. This excludes uninstrumented stages/nodes.
     // Mean of the last second, the same statistic as the stage rows (see stageTimings).
-    return chainTotalMsKnown() ? *impl_->snapshot.metrics.flow.enhancementProcessing.mean : 0.0;
+    return chainTotalMsKnown() ? *impl_->readoutSnapshot().metrics.flow.enhancementProcessing.mean : 0.0;
 }
 bool QmlPlayerBridge::chainTotalMsKnown() const {
-    const auto& sample = impl_->snapshot.metrics.flow.enhancementProcessing;
+    const auto& sample = impl_->readoutSnapshot().metrics.flow.enhancementProcessing;
     return queuedFramesKnown() && sample.samples > 0 && sample.mean &&
         std::isfinite(*sample.mean) && *sample.mean >= 0.0;
 }
@@ -2190,6 +2716,7 @@ bool QmlPlayerBridge::startCaptureSession() {
     return true;
 }
 void QmlPlayerBridge::openSourceUri(const std::wstring& uri, const std::wstring& label) {
+    if(impl_->browser)impl_->browser->setEnabled(false);
     rememberPosition(true);
     impl_->openingSource = true;
     impl_->openingSessionId = 0;
@@ -2435,6 +2962,7 @@ void QmlPlayerBridge::setupXbox() {
             auto& k = *impl_;
             if (k.preOpen) k.preOpen();
             k.engine.previewView({});
+            if(k.browser)k.browser->setEnabled(false);
             k.engine.openXbox(k.videoWindow, std::move(*request), k.options);
             k.openingSessionId = k.engine.snapshot().sessionId;
             refreshSubtitles({});
@@ -2539,6 +3067,7 @@ void QmlPlayerBridge::setupMoonlight() {
             auto& k = *impl_;
             if (k.preOpen) k.preOpen();
             k.engine.previewView({});
+            if(k.browser)k.browser->setEnabled(false);
             k.engine.openMoonlight(k.videoWindow, std::move(*request), k.options);
             k.openingSessionId = k.engine.snapshot().sessionId;
             refreshSubtitles({});
@@ -2779,6 +3308,7 @@ bool QmlPlayerBridge::ps5Connect() {
         auto& i = *impl_;
         if (i.preOpen) i.preOpen();
         i.engine.previewView({});
+        if(i.browser)i.browser->setEnabled(false);
         i.engine.openRemotePlay(i.videoWindow, std::move(*request), i.options);
         i.openingSessionId = i.engine.snapshot().sessionId;
         refreshSubtitles({});
@@ -3497,9 +4027,26 @@ void QmlPlayerBridge::tickImageBatch() {
 // --- subtitles (P4-c) --------------------------------------------------------
 namespace {
 const wchar_t* const kSubtitleFonts[] = {L"Microsoft YaHei UI", L"SimHei", L"SimSun", L"DengXian", L"Arial", L"Segoe UI"};
+QString subtitleBaseLanguage(const engine::SubtitleTrack& track) {
+    const auto base = QString::fromStdWString(track.language).trimmed().toLower()
+        .replace(QLatin1Char('_'), QLatin1Char('-')).section(QLatin1Char('-'), 0, 0);
+    if (base.isEmpty() || base == QLatin1String("und")) return {};
+    // Container ISO 639-2 codes and sidecar BCP-47 tags identify the same language.
+    static const QHash<QString, QString> aliases{
+        {"chi", "zh"}, {"zho", "zh"}, {"cmn", "zh"}, {"chs", "zh"}, {"cht", "zh"},
+        {"eng", "en"}, {"jpn", "ja"}, {"kor", "ko"}, {"deu", "de"}, {"ger", "de"},
+        {"fra", "fr"}, {"fre", "fr"}, {"spa", "es"}, {"rus", "ru"}, {"por", "pt"},
+        {"ita", "it"}, {"ara", "ar"}, {"hin", "hi"}, {"tha", "th"}, {"vie", "vi"},
+        {"ind", "id"}, {"nld", "nl"}, {"dut", "nl"}, {"pol", "pl"}, {"tur", "tr"},
+        {"swe", "sv"}, {"ukr", "uk"}
+    };
+    return aliases.value(base, base);
+}
 bool subtitleIsChinese(const engine::SubtitleTrack& t) {
+    const auto language = subtitleBaseLanguage(t);
+    if (!language.isEmpty()) return language == QLatin1String("zh");
     const auto has = [](const std::wstring& s, const wchar_t* k) { return s.find(k) != std::wstring::npos; };
-    return has(t.language, L"chi") || has(t.language, L"zho") || has(t.language, L"zh") || has(t.name, L"中") ||
+    return has(t.name, L"中") ||
            has(t.name, L"简") || has(t.name, L"繁");
 }
 void ensureGdiplus() {
@@ -3511,6 +4058,11 @@ void ensureGdiplus() {
 }
 void QmlPlayerBridge::refreshSubtitles(const std::wstring& media) {
     auto& i = *impl_;
+    if (i.onlineSubtitles) {
+        // Reopening the same path is still a new media generation.
+        i.onlineSubtitles->cancel();
+        i.onlineSubtitles->setMedia(i.sourceIsImage ? QString{} : QString::fromStdWString(media));
+    }
     i.subTracks.clear(); i.subExternal = i.subLoaded = 0;
     i.subPrimary = i.subSecondary = -1; i.subPrimaryChosen = i.subSecondaryChosen = false;
     i.subStatus.clear(); i.subMedia = media;
@@ -3534,18 +4086,34 @@ void QmlPlayerBridge::tickSubtitles() {
             i.subTracks.insert(i.subTracks.begin() + std::ptrdiff_t(i.subExternal),
                                std::make_move_iterator(result->tracks.begin()), std::make_move_iterator(result->tracks.end()));
             i.subLoaded = count;
-            int firstUsable = -1, firstChinese = -1;
+            int firstUsable = -1, firstKnownChinese = -1, firstChineseFallback = -1;
             for (size_t k = 0; k < i.subTracks.size(); ++k) {
                 if (!i.subTracks[k].usable()) continue;
                 if (firstUsable < 0) firstUsable = int(k);
-                if (firstChinese < 0 && subtitleIsChinese(i.subTracks[k])) firstChinese = int(k);
+                const auto language = subtitleBaseLanguage(i.subTracks[k]);
+                if (firstKnownChinese < 0 && language == QLatin1String("zh")) firstKnownChinese = int(k);
+                if (firstChineseFallback < 0 && language.isEmpty() && subtitleIsChinese(i.subTracks[k]))
+                    firstChineseFallback = int(k);
             }
-            if (!i.subPrimaryChosen) i.subPrimary = firstChinese >= 0 ? firstChinese : firstUsable;
+            if (!i.subPrimaryChosen)
+                i.subPrimary = firstKnownChinese >= 0 ? firstKnownChinese
+                             : firstChineseFallback >= 0 ? firstChineseFallback : firstUsable;
             if (!i.subSecondaryChosen && i.prefBool("subtitleSecondLanguage", false)) {
-                int candidate = -1;
-                for (size_t k = 0; k < i.subTracks.size(); ++k)
-                    if (i.subTracks[k].usable() && int(k) != i.subPrimary) { candidate = int(k); break; }
-                i.subSecondary = candidate;
+                const auto primaryLanguage = i.subPrimary >= 0
+                    ? subtitleBaseLanguage(i.subTracks[size_t(i.subPrimary)]) : QString{};
+                int candidate = -1, unknownFallback = -1;
+                for (size_t k = 0; k < i.subTracks.size(); ++k) {
+                    if (!i.subTracks[k].usable() || int(k) == i.subPrimary) continue;
+                    const auto language = subtitleBaseLanguage(i.subTracks[k]);
+                    if (language.isEmpty()) {
+                        if (unknownFallback < 0) unknownFallback = int(k);
+                    } else if (primaryLanguage.isEmpty() || language != primaryLanguage) {
+                        candidate = int(k);
+                        break;
+                    }
+                }
+                // A second format/region of the same language is not a second language.
+                i.subSecondary = candidate >= 0 ? candidate : unknownFallback;
             }
             if (result->complete)
                 for (const auto& t : i.subTracks)
@@ -3592,7 +4160,7 @@ void QmlPlayerBridge::tickSubtitles() {
             if (index < 0 || size_t(index) >= i.subTracks.size()) return;
             const auto& track = i.subTracks[size_t(index)];
             if (!track.usable()) return;
-            const double at = s.position + double(track.offsetMs) / 1000.0;
+            const double at = s.position - double(track.offsetMs) / 1000.0;
 #ifdef VEYRA_HAS_LIBASS
             if (track.ass) {
                 // ASS/SSA: libass draws the whole script (effects, karaoke,
@@ -3654,10 +4222,11 @@ QVariantList QmlPlayerBridge::subtitleTracks() const {
         if (label.isEmpty()) label = QString::fromStdWString(t.language);
         if (label.isEmpty()) label = tr("字幕 %1").arg(k + 1);
         QString note = t.embedded ? tr("内嵌") : tr("外挂");
+        if (!t.language.empty()) note += QStringLiteral(" \u00b7 ") + QString::fromStdWString(t.language);
         if (!t.codec.empty()) note += QStringLiteral(" · ") + QString::fromStdWString(t.codec).toUpper();
         if (!t.usable()) note += QStringLiteral(" · ") + (t.note.empty() ? tr("不可用") : QString::fromStdWString(t.note));
         out << QVariantMap{{"index", int(k)}, {"label", label}, {"note", note}, {"usable", t.usable()},
-                           {"embedded", t.embedded}, {"cues", int(t.cues.size())}, {"offsetMs", t.offsetMs}};
+                           {"embedded", t.embedded}, {"language", QString::fromStdWString(t.language)}, {"cues", int(t.cues.size())}, {"offsetMs", t.offsetMs}};
     }
     return out;
 }
@@ -3707,6 +4276,7 @@ void QmlPlayerBridge::setSubtitleBottomInset(int value) {
     impl_->subBottomInset = value;
     emit subtitlesChanged();
 }
+QObject* QmlPlayerBridge::onlineSubtitles() const { return impl_->onlineSubtitles.get(); }
 void QmlPlayerBridge::loadSubtitleDialog() {
     const QString start = impl_->subMedia.empty() ? QString() : QFileInfo(QString::fromStdWString(impl_->subMedia)).absolutePath();
     const QString path = QFileDialog::getOpenFileName(nullptr, tr("加载外部字幕"), start,
@@ -3782,6 +4352,30 @@ void QmlPlayerBridge::autoAlignSubtitle() {
 void QmlPlayerBridge::attachVideoWindow(qulonglong nativeHandle) {
     impl_->videoWindow = reinterpret_cast<HWND>(nativeHandle);
 }
+void QmlPlayerBridge::setBrowserMonitorWindow(qulonglong nativeHandle) {
+    if (impl_->browser) impl_->browser->setMonitorWindow(reinterpret_cast<HWND>(nativeHandle));
+}
+void QmlPlayerBridge::setBrowserPreviewTarget(qulonglong nativeHandle, bool visible) {
+    const uint64_t session = impl_->browser ? impl_->browser->previewSessionId() : 0;
+    engine::BrowserPreviewRequest next{uintptr_t(nativeHandle), session, 0,
+        visible && nativeHandle != 0 && session != 0};
+    next.comparisonMode = impl_->browserPreviewComparisonMode;
+    next.comparisonSplit = float(impl_->browserPreviewComparisonSplit);
+    const auto& previous = impl_->browserPreviewRequest;
+    if (previous.window == next.window && previous.sessionId == next.sessionId && previous.visible == next.visible &&
+        previous.comparisonMode == next.comparisonMode && previous.comparisonSplit == next.comparisonSplit)
+        return;
+    const bool presentationOnly = previous.window == next.window &&
+        previous.sessionId == next.sessionId && previous.visible == next.visible;
+    const auto& displayed = impl_->snapshot.browserPreview;
+    impl_->browserPreviewRetainedRevision = presentationOnly && displayed.hasFrame &&
+        displayed.window == next.window && displayed.sessionId == next.sessionId
+        ? displayed.revision : 0;
+    next.revision = previous.revision + 1;
+    impl_->browserPreviewRequest = next;
+    impl_->engine.requestBrowserPreview(next);
+    emit browserPreviewChanged();
+}
 
 void QmlPlayerBridge::setPreOpenHook(std::function<void()> hook) {
     impl_->preOpen = std::move(hook);
@@ -3810,21 +4404,22 @@ QString QmlPlayerBridge::durationText() const { return mmss(impl_->snapshot.dura
 
 // --- source -----------------------------------------------------------------
 QString QmlPlayerBridge::sourceName() const {
+    if (impl_->browser && impl_->browser->enabled()) return tr("浏览器视频");
     if (impl_->sourceLabel.empty()) return QString();
     return QFileInfo(utf8Of(impl_->sourceLabel)).fileName();
 }
 QString QmlPlayerBridge::sourceSummary() const {
-    const auto& s = impl_->snapshot;
+    const auto& s = impl_->readoutSnapshot();
     if (!s.sourceWidth) return QString();
     // Reported values only: no upscaling claim, no invented bit depth.
     return QStringLiteral("%1x%2").arg(s.sourceWidth).arg(s.sourceHeight);
 }
-int QmlPlayerBridge::sourceWidth() const { return int(impl_->snapshot.sourceWidth); }
-int QmlPlayerBridge::sourceHeight() const { return int(impl_->snapshot.sourceHeight); }
-double QmlPlayerBridge::sourceFps() const { return impl_->snapshot.nominalSourceFps; }
-int QmlPlayerBridge::sourceRotation() const { return impl_->snapshot.sourceRotationDegrees; }
+int QmlPlayerBridge::sourceWidth() const { return int(impl_->readoutSnapshot().sourceWidth); }
+int QmlPlayerBridge::sourceHeight() const { return int(impl_->readoutSnapshot().sourceHeight); }
+double QmlPlayerBridge::sourceFps() const { return impl_->readoutSnapshot().nominalSourceFps; }
+int QmlPlayerBridge::sourceRotation() const { return impl_->readoutSnapshot().sourceRotationDegrees; }
 double QmlPlayerBridge::sourceAspect() const {
-    const auto& s = impl_->snapshot;
+    const auto& s = impl_->readoutSnapshot();
     // The container's display aspect already accounts for sample aspect ratio and
     // rotation, so prefer it. The pixel ratio is only a fallback for a source that
     // reported none, and it is never presented as more than that.
@@ -3843,24 +4438,37 @@ static bool xessPresenting(const engine::PlayerSnapshot& s) {
         s.metrics.flow.xessSdkSubmitFps > 0;
 }
 double QmlPlayerBridge::submitFps() const {
-    const auto& s = impl_->snapshot;
+    if (browserEnabled()) {
+        const auto view = impl_->browser->telemetry();
+        return view.last ? view.last->submitFps.value_or(0) : 0;
+    }
+    const auto& s = impl_->readoutSnapshot();
     return xessPresenting(s) ? s.metrics.flow.xessSdkSubmitFps : s.submissionFps.value_or(0.0);
 }
-bool QmlPlayerBridge::submitFpsKnown() const { return xessPresenting(impl_->snapshot) || impl_->snapshot.submissionFps.has_value(); }
-QString QmlPlayerBridge::submitFpsLabel() const { return xessPresenting(impl_->snapshot) ? tr("SDK 提交") : tr("提交"); }
-double QmlPlayerBridge::lateMs() const { return impl_->snapshot.lateMs; }
-double QmlPlayerBridge::lateP95Ms() const { return impl_->snapshot.lateP95Ms; }
+bool QmlPlayerBridge::submitFpsKnown() const {
+    if (browserEnabled()) {
+        const auto view = impl_->browser->telemetry();
+        return view.last && view.last->submitFps.has_value();
+    }
+    return xessPresenting(impl_->snapshot) || impl_->snapshot.submissionFps.has_value();
+}
+QString QmlPlayerBridge::submitFpsLabel() const {
+    if (browserEnabled() && !impl_->browser->telemetry().live && impl_->browser->telemetry().last) return tr("历史采样");
+    return xessPresenting(impl_->readoutSnapshot()) ? tr("SDK 提交") : tr("提交");
+}
+double QmlPlayerBridge::lateMs() const { return impl_->readoutSnapshot().lateMs; }
+double QmlPlayerBridge::lateP95Ms() const { return impl_->readoutSnapshot().lateP95Ms; }
 QString QmlPlayerBridge::metricsSummary() const {
-    const auto& s = impl_->snapshot;
+    const auto& s = impl_->readoutSnapshot();
     // Submit FPS, named as such: it is what we handed to the presenter, not what
     // the panel scanned out. There is no "display FPS" because we cannot measure
     // one, and a number we did not measure must not be shown as if we had.
     if (!s.submissionFps) return tr("未测量");
     return tr("提交 %1").arg(*s.submissionFps, 0, 'f', 1);
 }
-bool QmlPlayerBridge::nrActive() const { return impl_->snapshot.nrActive; }
-bool QmlPlayerBridge::nrAutoActive() const {return impl_->snapshot.nrAutoActive;}
-int QmlPlayerBridge::nrAutoPercent() const {return int(impl_->snapshot.nrAutoPercent);}
+bool QmlPlayerBridge::nrActive() const { return impl_->snapshot.nrActive && (!browserEnabled() || impl_->browser->telemetry().live); }
+bool QmlPlayerBridge::nrAutoActive() const {return impl_->snapshot.nrAutoActive && (!browserEnabled() || impl_->browser->telemetry().live);}
+int QmlPlayerBridge::nrAutoPercent() const {return int(impl_->readoutSnapshot().nrAutoPercent);}
 QString QmlPlayerBridge::nrAutoStatus() const {
     const auto& s=impl_->snapshot;
     if(s.nrAutoActive)return tr("NR 自动 %1% · %2×%3").arg(s.nrAutoPercent).arg(s.nrAutoWidth).arg(s.nrAutoHeight);
@@ -3868,11 +4476,11 @@ QString QmlPlayerBridge::nrAutoStatus() const {
     if(!s.nrAutoStatus.empty())return tr("当前配置未启用自动 NR，保留固定 1080p 档");
     return {};
 }
-bool QmlPlayerBridge::srActive() const { return impl_->snapshot.srActive; }
-bool QmlPlayerBridge::fgActive() const { return impl_->snapshot.fgActive; }
+bool QmlPlayerBridge::srActive() const { return impl_->snapshot.srActive && (!browserEnabled() || impl_->browser->telemetry().live); }
+bool QmlPlayerBridge::fgActive() const { return impl_->snapshot.fgActive && (!browserEnabled() || impl_->browser->telemetry().live); }
 bool QmlPlayerBridge::captureRecovering() const { return impl_->snapshot.captureRecovering; }
-double QmlPlayerBridge::captureFps() const { return impl_->snapshot.captureFps; }
-double QmlPlayerBridge::captureDropped() const { return double(impl_->snapshot.captureDropped); }
+double QmlPlayerBridge::captureFps() const { return impl_->readoutSnapshot().captureFps; }
+double QmlPlayerBridge::captureDropped() const { return double(impl_->readoutSnapshot().captureDropped); }
 QString QmlPlayerBridge::backendWarning() const { return uiText(impl_->snapshot.backendWarning); }
 
 // --- settings ---------------------------------------------------------------
@@ -3931,6 +4539,85 @@ void QmlPlayerBridge::setSrEnabled(bool enabled) {
             setEffectEnabled(int(i), enabled); return;
         }
     if (enabled) emit notice(tr("请先添加超分节点"), true);
+}
+bool QmlPlayerBridge::beautyEnabled() const {
+    const auto* node = impl_->chain.firstOf(engine::EffectType::Beauty); return node && node->enabled;
+}
+void QmlPlayerBridge::setBeautyEnabled(bool enabled) {
+    if (isImage() && sourceKind() != QStringLiteral("browser")) { emit notice(tr("美颜暂不支持图片源"), true); return; }
+    for (uint32_t i = 0; i < impl_->chain.nodeCount; ++i)
+        if (impl_->chain.nodes[i].type == engine::EffectType::Beauty) { setEffectEnabled(int(i), enabled); return; }
+    if (!enabled) return;
+    const int index = addEffect(QStringLiteral("beauty"));
+    if (index >= 0) setEffectEnabled(index, true);
+}
+double QmlPlayerBridge::beautySmoothing() const {
+    const auto* n = impl_->chain.firstOf(engine::EffectType::Beauty);
+    return double(n ? n->beauty.smoothing : engine::BeautySettings{}.smoothing);
+}
+double QmlPlayerBridge::beautyWhitening() const {
+    const auto* n = impl_->chain.firstOf(engine::EffectType::Beauty);
+    return double(n ? n->beauty.whitening : engine::BeautySettings{}.whitening);
+}
+double QmlPlayerBridge::beautyDetail() const {
+    const auto* n = impl_->chain.firstOf(engine::EffectType::Beauty);
+    return double(n ? n->beauty.detail : engine::BeautySettings{}.detail);
+}
+void QmlPlayerBridge::setBeautySmoothing(double value) { setBeautyParameter(QStringLiteral("smoothing"), value); }
+void QmlPlayerBridge::setBeautyWhitening(double value) { setBeautyParameter(QStringLiteral("whitening"), value); }
+void QmlPlayerBridge::setBeautyDetail(double value) { setBeautyParameter(QStringLiteral("detail"), value); }
+bool QmlPlayerBridge::setBeautyParameter(const QString& key, double value) {
+    if (isImage() && sourceKind() != QStringLiteral("browser")) { emit notice(tr("美颜暂不支持图片源"), true); return false; }
+    if (!std::isfinite(value) || value < 0.0 || value > 1.0 ||
+        (key != QLatin1String("smoothing") && key != QLatin1String("whitening") && key != QLatin1String("detail")))
+        return false;
+    auto* n = impl_->chain.firstOf(engine::EffectType::Beauty);
+    if (!n) {
+        // Adding a dormant singleton never changes the picture; only its switch enables it.
+        if (addEffect(QStringLiteral("beauty")) < 0) return false;
+        n = impl_->chain.firstOf(engine::EffectType::Beauty);
+    }
+    if (!n) return false;
+    auto& v = key == QLatin1String("smoothing") ? n->beauty.smoothing :
+        key == QLatin1String("whitening") ? n->beauty.whitening : n->beauty.detail;
+    if (double(v) == value) return true;
+    const auto before = *n; v = float(value);
+    if (!impl_->revalidate(true)) {
+        const auto error = impl_->validation.message; *n = before;
+        impl_->revalidate(); emit notice(uiText(error), true); return false;
+    }
+    emit settingsChanged(); emit chainChanged(); return true;
+}
+QVariantMap QmlPlayerBridge::beautyMetrics() const {
+    const auto& s = impl_->readoutSnapshot();
+    const auto& sample = s.metrics.flow.gpuTiming[size_t(diagnostics::GpuStage::Beauty)];
+    // A sample belongs to the actual applied frame/revision, not to an older
+    // enabled configuration while a new OFF/HDR/zero-strength request is pending.
+    const bool appliedMatches = s.applied.beauty.enabled == beautyEnabled() &&
+        double(s.applied.beauty.smoothing) == beautySmoothing() &&
+        double(s.applied.beauty.whitening) == beautyWhitening() &&
+        double(s.applied.beauty.detail) == beautyDetail();
+    const bool imageUnsupported = isImage() && sourceKind() != QStringLiteral("browser");
+    const bool measured = !imageUnsupported && beautyEnabled() && appliedMatches && s.beautyActive &&
+        queuedFramesKnown() && sample.samples > 0 &&
+        sample.mean && std::isfinite(*sample.mean) && *sample.mean >= 0.0;
+    const bool frozen = browserEnabled() ? !impl_->browser->telemetry().live : paused();
+    const QString state = imageUnsupported ? QStringLiteral("unsupported") :
+        !beautyEnabled() ? QStringLiteral("off") :
+        measured ? (frozen ? QStringLiteral("frozen") : QStringLiteral("measured")) :
+        appliedMatches && s.applied.beauty.enabled && !s.beautyActive &&
+        (s.running || s.image) && s.sessionId != 0 ? QStringLiteral("bypass") : QStringLiteral("waiting");
+    const QString fallback = imageUnsupported ? tr("暂不支持图片源") :
+        state == QLatin1String("off") ? tr("已关闭") :
+        state == QLatin1String("waiting") ? tr("等待 GPU 样本") : tr("已旁路");
+    return {{QStringLiteral("state"), state},
+            {QStringLiteral("status"), imageUnsupported || state == QLatin1String("off") || !appliedMatches || s.beautyStatus.empty() ? fallback : QString::fromStdWString(s.beautyStatus)},
+            {QStringLiteral("measured"), measured},
+            {QStringLiteral("meanMs"), measured ? *sample.mean : 0.0},
+            {QStringLiteral("p95Ms"), measured && sample.p95 && std::isfinite(*sample.p95) ? *sample.p95 : 0.0},
+            {QStringLiteral("samples"), QVariant::fromValue<qulonglong>(measured ? sample.samples : 0)},
+            {QStringLiteral("evaluated"), QVariant::fromValue<qulonglong>(s.beautyEvaluated)},
+            {QStringLiteral("domain"), QStringLiteral("GPU timestamp mean")}};
 }
 bool QmlPlayerBridge::videoHdr() const {
     const auto* node = impl_->chain.firstOf(engine::EffectType::VideoHdr);
@@ -4295,6 +4982,7 @@ QVariantList QmlPlayerBridge::chain() const {
         QVariantMap item;
         item["index"] = int(i);
         item["id"] = c.mode == engine::ChainMode::Node ? impl_->layout.ids[i] : i + 2;
+        item["fixedOrder"] = node.type == engine::EffectType::Beauty;
         item["type"] = utf8Of(info.id);
         item["label"] = uiText(info.label);
         if(node.type==engine::EffectType::FrameGeneration)
@@ -4483,17 +5171,17 @@ void QmlPlayerBridge::setNodeMode(int mode) {
     if (!next.validate().empty()) { emit notice(tr("模式参数无效，未切换"), true); return; }
     // Save before changing the live mode; an unwritable/corrupt file cannot
     // silently discard the configuration the user is about to leave.
-    if (!impl_->facade.saveChainSession(candidate)) { emit notice(uiText(impl_->facade.error()), true); return; }
-    if (!impl_->facade.applySettings(next,engine::runtimeOrder(configuration.chain))) {
+    if (!impl_->saveSourceSession(candidate, impl_->browserProfileActive)) { emit notice(impl_->sourceProfileError, true); return; }
+    if (!impl_->applySettings(next,engine::runtimeOrder(configuration.chain))) {
         impl_->facade.setPending(previousSettings);
-        if (!impl_->facade.saveChainSession(previousSession))
-            emit notice(tr("引擎拒绝切换，存档回退失败：") + uiText(impl_->facade.error()), true);
+        if (!impl_->saveSourceSession(previousSession, impl_->browserProfileActive))
+            emit notice(tr("引擎拒绝切换，存档回退失败：") + impl_->sourceProfileError, true);
         emit notice(tr("引擎未接受模式设置，当前配置不变"), true); return;
     }
     impl_->session = impl_->savedSession = candidate;
     impl_->restoreConfiguration(configuration);
     impl_->revalidate();
-    impl_->options = engine::PlayerOptions::from(next,engine::runtimeOrder(impl_->activeRuntime()));
+    impl_->options = impl_->playbackOptions(next,engine::runtimeOrder(impl_->activeRuntime()));
     emit chainChanged();
     emit settingsChanged();
 }
@@ -4590,8 +5278,8 @@ void QmlPlayerBridge::resumeCaptureSession() {
     queryCapture(2, impl_->captureDevice);
 }
 
-QString QmlPlayerBridge::colorStatus() const { return uiText(impl_->snapshot.colorStatus); }
-QString QmlPlayerBridge::videoHdrStatus() const { return uiText(impl_->snapshot.videoHdrStatus); }
+QString QmlPlayerBridge::colorStatus() const { return uiText(impl_->readoutSnapshot().colorStatus); }
+QString QmlPlayerBridge::videoHdrStatus() const { return uiText(impl_->readoutSnapshot().videoHdrStatus); }
 
 // --- export -----------------------------------------------------------------
 // Poll the export job once per UI tick. Its snapshot is the source of the
@@ -4696,7 +5384,71 @@ void QmlPlayerBridge::setExportTrimEnd(double seconds) {
     emit exportChanged();
 }
 
+bool QmlPlayerBridge::srFollowDisplay() const {
+    return impl_->prefBool("srFollowDisplay",false);
+}
+void QmlPlayerBridge::setSrFollowDisplay(bool enabled) {
+    if(enabled==srFollowDisplay())return;
+    const auto oldPrefs=impl_->prefs;
+    impl_->prefs[QStringLiteral("srFollowDisplay")]=enabled;
+    if(!impl_->savePrefs()){
+        impl_->prefs=oldPrefs;emit notice(tr("自动目标设置保存失败"),true);return;
+    }
+    const auto manual=settings();
+    if(!impl_->applySettings(manual,engine::runtimeOrder(impl_->activeRuntime()))){
+        impl_->prefs=oldPrefs;(void)impl_->savePrefs();
+        emit notice(tr("引擎未接受自动目标，已保留原设置"),true);return;
+    }
+    impl_->options=impl_->playbackOptions(manual,engine::runtimeOrder(impl_->activeRuntime()));
+    refreshPlaybackDisplay(true);
+    emit settingsChanged();emit preferencesChanged();
+}
+void QmlPlayerBridge::refreshPlaybackDisplay(bool force) {
+    if(impl_->browser&&impl_->browser->enabled())return; // Browser region owns the monitor/extent.
+    if(!impl_->videoWindow||!IsWindow(impl_->videoWindow))return;
+    MONITORINFO info{sizeof(info)};
+    const auto monitor=MonitorFromWindow(impl_->videoWindow,MONITOR_DEFAULTTONEAREST);
+    if(!monitor||!GetMonitorInfoW(monitor,&info))return;
+    const pipeline::Extent display{unsigned(info.rcMonitor.right-info.rcMonitor.left),
+        unsigned(info.rcMonitor.bottom-info.rcMonitor.top)};
+    if(!display.valid())return;
+    const auto now=GetTickCount64();
+    if(display!=impl_->candidateDisplay){
+        impl_->candidateDisplay=display;impl_->displayCandidateSince=now;
+    }
+    if(!force&&now-impl_->displayCandidateSince<350)return;
+    const bool changed=display!=impl_->playbackDisplay;
+    impl_->playbackDisplay=display;
+    const auto order=engine::runtimeOrder(impl_->activeRuntime());
+    const auto manual=settings();
+    const auto effective=impl_->playbackSettings(manual,order);
+    const auto snapshot=impl_->engine.snapshot();
+    const auto desired=snapshot.desired;
+    if(effective.srPlaybackExtent!=desired.srPlaybackExtent){
+        // A rejected GPU rebuild must not become a periodic restart loop.
+        // Retry only after a new screen/settings/session or an explicit force.
+        if(!force&&impl_->lastDisplayAttempt&&*impl_->lastDisplayAttempt==effective&&
+            impl_->lastDisplayAttemptSession==snapshot.sessionId)return;
+        impl_->lastDisplayAttempt=effective;
+        impl_->lastDisplayAttemptSession=snapshot.sessionId;
+        if(!impl_->applySettings(manual,order)){
+            veyra::log::warn("playback-display","automatic target request rejected; no periodic retry");
+            return;
+        }
+        impl_->options=impl_->playbackOptions(manual,order);
+        veyra::log::info("playback-display",std::format(
+            "physical={}x{} playbackLimit={}x{} manualSrTarget={} follow={} image={} node={}",
+            display.width,display.height,effective.srPlaybackExtent.width,effective.srPlaybackExtent.height,
+            int(manual.srTarget),srFollowDisplay(),impl_->sourceIsImage,order.has_value()));
+        emit settingsChanged();
+    } else if(changed)emit settingsChanged();
+}
 QString QmlPlayerBridge::srTargetLabel() const {
+    if(srFollowDisplay()&&impl_->chain.mode==engine::ChainMode::List&&!impl_->sourceIsImage){
+        const auto extent=engine::boundedPlaybackDisplayExtent(impl_->playbackDisplay);
+        if(extent.valid())return tr("自动 · %1×%2").arg(extent.width).arg(extent.height);
+        return tr("自动 · 等待屏幕");
+    }
     // The label follows the SR target, because that is what sets the output size.
     switch (srTargetIndex()) {
     case 1: return QStringLiteral("2K");
@@ -4710,6 +5462,7 @@ QString QmlPlayerBridge::srTargetLabel() const {
 }
 
 int QmlPlayerBridge::srTargetIndex() const {
+    if(srFollowDisplay()&&impl_->chain.mode==engine::ChainMode::List&&!impl_->sourceIsImage)return 7;
     // UI IDs 1/2/3 remain 2K/4K/8K; append 4/5/6 for 5K/6K/7K.
     switch (settings().srTarget) {
     case pipeline::SrTarget::Qhd: return 1;
@@ -4722,7 +5475,9 @@ int QmlPlayerBridge::srTargetIndex() const {
     return 0;
 }
 void QmlPlayerBridge::setSrTargetIndex(int index) {
+    if(index==7){setSrFollowDisplay(true);return;}
     if(index<1||index>6)return;
+    if(srFollowDisplay())setSrFollowDisplay(false);
     auto s = settings();
     pipeline::SrTarget want = pipeline::SrTarget::Uhd4K;
     switch (index) {
@@ -4796,12 +5551,17 @@ void QmlPlayerBridge::openFileDialog() {
         nullptr, tr("打开视频或图片"), QString(),
         tr("媒体文件 (*.mp4 *.mkv *.mov *.avi *.webm *.ts *.m2ts *.jpg *.jpeg *.png *.bmp *.webp);;所有文件 (*)"));
     veyra::log::info("qml-file", path.isEmpty() ? "openFileDialog cancelled" : "openFileDialog selected file");
-    if (!path.isEmpty()) openPath(path);
+    if (!path.isEmpty()) launchLocalFile(path);
 }
 int QmlPlayerBridge::thumbnailGeneration() const { return impl_->thumbnailGeneration; }
 
 void QmlPlayerBridge::openPath(const QString& path) {
     if (path.isEmpty()) return;
+    if (impl_->browserHostAvailable && impl_->localFileLauncher) { launchLocalFile(path); return; }
+    if(impl_->browser)impl_->browser->setEnabled(false);
+    if (impl_->browserProfileActive) {
+        emit notice(tr("浏览器方案尚未保存，无法安全切换本地视频：") + impl_->sourceProfileError, true); return;
+    }
     rememberPosition(true);
     impl_->exportQueue.setSelectedId(0);
     ++impl_->liveOpenGen; impl_->pendingLiveText.clear();   // a waiting live open is dropped
@@ -4811,6 +5571,8 @@ void QmlPlayerBridge::openPath(const QString& path) {
     impl_->openingSource = true;
     impl_->openingSessionId = 0;
     const std::wstring wide = wideOf(path);
+    const auto suffix=QFileInfo(path).suffix().toLower();
+    impl_->sourceIsImage=QStringList{"jpg","jpeg","png"}.contains(suffix);
     impl_->sourceLabel = wide;
     impl_->liveKind.clear();
     impl_->liveLabel.clear();
@@ -4830,6 +5592,8 @@ void QmlPlayerBridge::openPath(const QString& path) {
         emit navigate(QStringLiteral("min"));
     rememberSource(QStringLiteral("file"), path);
     if (impl_->preOpen) impl_->preOpen();
+    refreshPlaybackDisplay(true);
+    impl_->options=impl_->playbackOptions(settings(),engine::runtimeOrder(impl_->activeRuntime()));
     auto options = impl_->options;
     options.softwareDecode = impl_->prefString("decode") == QLatin1String("software");
     options.hardwareDecodeOnly = impl_->prefString("decode") == QLatin1String("hardware");
@@ -4870,6 +5634,8 @@ void QmlPlayerBridge::togglePlayPause() {
     veyra::log::info("ui-transport", pause ? "pause" : "resume");
 }
 void QmlPlayerBridge::stopPlayback() {
+    if (impl_->onlineSubtitles) impl_->onlineSubtitles->setMedia({});
+    if(impl_->browser)impl_->browser->setEnabled(false);
     rememberPosition(true);
     ++impl_->liveOpenGen; impl_->pendingLiveText.clear();
     impl_->openingSource = false;
@@ -4887,7 +5653,7 @@ void QmlPlayerBridge::openUrl(const QUrl& url) {
     }
     // Opened inside the drop, as AppShell's WM_DROPFILES does.
     veyra::log::info("ui-drop", url.toLocalFile().toStdString());
-    openPath(QDir::toNativeSeparators(url.toLocalFile()));
+    launchLocalFile(QDir::toNativeSeparators(url.toLocalFile()));
 }
 void QmlPlayerBridge::logUi(const QString& channel, const QString& text) {
     const std::string c = channel.toStdString();
@@ -4899,6 +5665,8 @@ void QmlPlayerBridge::setWindowMask(QObject* window, const QRectF& rect) {
     w->setMask(QRegion(rect.toAlignedRect()));
 }
 void QmlPlayerBridge::holdOriginal(bool held) {
+    // Browser comparison belongs exclusively to its secondary monitor output.
+    if (impl_->browser && impl_->browser->enabled()) return;
     // Releasing the key returns to whatever the 显示 page chose (off or split).
     if (held) impl_->engine.comparison(1, false);
     else impl_->engine.comparison(impl_->compareMode, impl_->compareBase, float(impl_->compareSplit));
@@ -4977,7 +5745,7 @@ bool QmlPlayerBridge::setPreference(const QString& key, const QVariant& value) {
         {"listInspectorWidth", {376, 4000}}};
     static const QStringList flags{"subtitleEnabled", "subtitleBackground", "subtitleFit",
                                    "subtitleSecondLanguage", "audioForceStereo", "holdCompare",
-                                   "magewellLowLatency", "cinePillHidden", "exportStopsPlayback", "obsGameCapture", "autoResume", "fullscreenMemoryProtection", "prewarmEnhancement"};
+                                   "magewellLowLatency", "cinePillHidden", "exportStopsPlayback", "obsGameCapture", "autoResume", "fullscreenMemoryProtection", "prewarmEnhancement", "browserRtxSourceSized"};
     QVariant stored;
     if (ranges.contains(key)) {
         bool ok = false; const int n = value.toInt(&ok);
@@ -5055,6 +5823,8 @@ bool QmlPlayerBridge::setPreference(const QString& key, const QVariant& value) {
     return true;
 }
 void QmlPlayerBridge::applyPreference(const QString& key) {
+    if (key == QLatin1String("browserRtxSourceSized") && impl_->browser)
+        impl_->browser->setRtxSourceSized(impl_->prefBool("browserRtxSourceSized", true));
     if(key==QLatin1String("prewarmEnhancement")){
         impl_->engine.setEnhancementPrewarmEnabled(impl_->prefBool("prewarmEnhancement",false));
         if(impl_->prefBool("prewarmEnhancement",false))scheduleEnhancementPrewarm();
@@ -5200,7 +5970,8 @@ bool QmlPlayerBridge::eventFilter(QObject* watched, QEvent* event) {
             // Typing into a text field never compares.
             const QObject* focus = QGuiApplication::focusObject();
             const bool typing = focus && (focus->inherits("QQuickTextInput") || focus->inherits("QQuickTextEdit"));
-            if (!hold.isEmpty() && hold[0].toCombined() == pressed && !typing && impl_->prefBool("holdCompare", true)) {
+            if (!(impl_->browser && impl_->browser->enabled()) && !hold.isEmpty() &&
+                hold[0].toCombined() == pressed && !typing && impl_->prefBool("holdCompare", true)) {
                 const bool down = type == QEvent::KeyPress;
                 if (down != impl_->holdKeyDown) { impl_->holdKeyDown = down; holdOriginal(down); }
                 return true;
@@ -5334,6 +6105,7 @@ void QmlPlayerBridge::quit() {
 }
 
 void QmlPlayerBridge::openCaptureDialog() { emit navigate(QStringLiteral("capture")); }
+void QmlPlayerBridge::openBrowserDialog() { emit navigate(QStringLiteral("browser")); }
 void QmlPlayerBridge::openPs5Dialog() { emit navigate(QStringLiteral("ps5")); }
 void QmlPlayerBridge::openScreenCaptureDialog() { emit navigate(QStringLiteral("screen")); }
 void QmlPlayerBridge::openAudioDialog() { emit navigate(QStringLiteral("audio")); }
@@ -5388,7 +6160,8 @@ int QmlPlayerBridge::addEffect(const QString& type) {
                 emit notice(tr("该类型节点已达上限（含禁用和未连接节点）"), true); return -1;
             }
             index = int(c.nodeCount++);
-            auto& node = c.nodes[index]; node = engine::ChainNode{}; node.type = info->type; node.enabled = true;
+            auto& node = c.nodes[index]; node = engine::ChainNode{}; node.type = info->type;
+            node.enabled = info->type != engine::EffectType::Beauty;
             node.viewX = float(index % 4) * 260; node.viewY = float(index / 4) * 300;
             if (info->type == engine::EffectType::NrEnhance) {
                 node.nr.runtime = previous.nrRuntime; node.nr.lowLatencyPairing = previous.lowLatency;
@@ -5401,7 +6174,9 @@ int QmlPlayerBridge::addEffect(const QString& type) {
                     const int at = impl_->layout.indexOf(c, next);
                     const auto t = c.nodes[at].type;
                     if (t == engine::EffectType::FrameGeneration ||
-                        (info->type != engine::EffectType::FrameGeneration && t == engine::EffectType::VideoHdr)) break;
+                        (info->type != engine::EffectType::FrameGeneration && t == engine::EffectType::VideoHdr) ||
+                        (info->type != engine::EffectType::Beauty && info->type != engine::EffectType::VideoHdr &&
+                         info->type != engine::EffectType::FrameGeneration && t == engine::EffectType::Beauty)) break;
                     predecessor = next; next = impl_->layout.next[at];
                 }
                 if (predecessor == 0) impl_->layout.inputNext = id;
@@ -5436,11 +6211,11 @@ int QmlPlayerBridge::addEffect(const QString& type) {
         impl_->validation=engine::validateChain(c);
         if(!impl_->validation.accepted||!next.validate().empty()||
            !unavailableEffects(next).isEmpty()||
-           !impl_->facade.applySettings(next,engine::runtimeOrder(c))) {
+           !impl_->applySettings(next,engine::runtimeOrder(c))) {
             c=before;impl_->facade.setPending(previous);impl_->validation=engine::validateChain(c);
             emit notice(tr("补帧选择未被接受，保留原设置；请检查倍率和后端能力"),true);return -1;
         }
-        impl_->options=engine::PlayerOptions::from(next,engine::runtimeOrder(c));
+        impl_->options=impl_->playbackOptions(next,engine::runtimeOrder(c));
         emit settingsChanged();emit chainChanged();return slot;
     }
     engine::EffectType wanted = engine::EffectType::NrEnhance;
@@ -5472,7 +6247,11 @@ int QmlPlayerBridge::addEffect(const QString& type) {
     if (wanted != engine::EffectType::FrameGeneration) {
         for (uint32_t i = 0; i < c.nodeCount; ++i) {
             const auto& nodeInfo = engine::effectInfo(c.nodes[i].type);
-            if (nodeInfo.mustBeLast||(wanted==engine::EffectType::Color&&c.nodes[i].type==engine::EffectType::VideoHdr)||
+            if (nodeInfo.mustBeLast||
+                (wanted != engine::EffectType::Beauty && wanted != engine::EffectType::VideoHdr &&
+                 c.nodes[i].type == engine::EffectType::Beauty) ||
+                (wanted == engine::EffectType::Beauty && c.nodes[i].type == engine::EffectType::VideoHdr) ||
+                (wanted==engine::EffectType::Color&&c.nodes[i].type==engine::EffectType::VideoHdr)||
                 (wanted==engine::EffectType::NrEnhance&&
                 (c.nodes[i].type==engine::EffectType::Protection||c.nodes[i].type==engine::EffectType::VideoHdr))) { insertAt = i; break; }
         }
@@ -5484,7 +6263,8 @@ int QmlPlayerBridge::addEffect(const QString& type) {
     c.nodes[insertAt].type = wanted;
     // A new list-mode NR layer arrives switched off: adding a layer must not
     // change the picture until the user turns it on.
-    c.nodes[insertAt].enabled = !(wanted == engine::EffectType::NrEnhance && c.mode == engine::ChainMode::List);
+    c.nodes[insertAt].enabled = wanted != engine::EffectType::Beauty &&
+        !(wanted == engine::EffectType::NrEnhance && c.mode == engine::ChainMode::List);
     if(wanted==engine::EffectType::Color)impl_->selectedColour=int(insertAt);
     if(wanted==engine::EffectType::NrEnhance){
         c.nodes[insertAt].nr.runtime=settings().nrRuntime;
@@ -5550,6 +6330,9 @@ bool QmlPlayerBridge::resetNode(uint id) {
     const int index = nodeIndexForId(id);
     if (index < 0) return false;
     auto& node = impl_->chain.nodes[index];
+    if (node.type == engine::EffectType::Beauty && isImage() && sourceKind() != QStringLiteral("browser")) {
+        emit notice(tr("美颜暂不支持图片源"), true); return false;
+    }
     const auto before = node; const auto multiplier = impl_->chain.fgMultiplier;
     const auto strict = impl_->chain.fgStrictAdmission;
     const auto previous = impl_->facade.pendingSettings();
@@ -5601,6 +6384,10 @@ bool QmlPlayerBridge::disconnectNode(uint from) {
 
 bool QmlPlayerBridge::insertNodeAfter(uint id, uint after) {
     if (impl_->chain.mode != engine::ChainMode::Node) return false;
+    const int index = nodeIndexForId(id);
+    if (index >= 0 && impl_->chain.nodes[index].type == engine::EffectType::Beauty) {
+        emit notice(tr("美颜固定在超分和 NR 后、HDR 和补帧前；可移动画布位置"), true); return false;
+    }
     const auto before = impl_->layout;
     const auto result = impl_->layout.insertAfter(impl_->chain, id, after);
     if (!result.accepted) { emit notice(uiText(result.message), true); return false; }
@@ -5634,6 +6421,9 @@ bool QmlPlayerBridge::removeEffect(int index) {
     auto& c = impl_->chain;
     if (index < 0 || uint32_t(index) >= c.nodeCount) return false;
     const auto& info = engine::effectInfo(c.nodes[index].type);
+    if (c.nodes[index].type == engine::EffectType::Beauty) {
+        emit notice(tr("美颜为固定阶段，请使用开关关闭"), true); return false;
+    }
     if (info.mustBeLast) { emit notice(tr("补帧固定为最后一步，不能删除"), true); return false; }
     const bool live=c.mode==engine::ChainMode::Node||c.nodes[index].type==engine::EffectType::NrEnhance||c.nodes[index].type==engine::EffectType::Color;
     const auto before=c; const int selected=impl_->selectedNr,colourSelected=impl_->selectedColour;
@@ -5665,6 +6455,9 @@ bool QmlPlayerBridge::moveEffect(int from, int to) {
     if (c.mode == engine::ChainMode::Node) {
         if (from == to) return true;
         return insertNodeAfter(impl_->layout.ids[from], impl_->layout.ids[to]);
+    }
+    if (c.nodes[from].type == engine::EffectType::Beauty || c.nodes[to].type == engine::EffectType::Beauty) {
+        emit notice(tr("美颜处理位置固定；可移动画布位置"), true); return false;
     }
     // The two pinned stages cannot be dragged; the UI greys them, and the
     // engine refuses them too so a script cannot route around the UI.
@@ -5702,6 +6495,8 @@ bool QmlPlayerBridge::moveEffect(int from, int to) {
 
 bool QmlPlayerBridge::setEffectEnabled(int index, bool enabled) {
     auto& c = impl_->chain;
+    if (index >= 0 && uint32_t(index) < c.nodeCount && c.nodes[index].type == engine::EffectType::Beauty &&
+        isImage() && sourceKind() != QStringLiteral("browser")) { emit notice(tr("美颜暂不支持图片源"), true); return false; }
     if (index < 0 || uint32_t(index) >= c.nodeCount) return false;
     if (c.nodes[index].enabled == enabled) return true;
     c.nodes[index].enabled = enabled;
@@ -5787,6 +6582,58 @@ QVariantMap QmlPlayerBridge::effectDescriptor(const QString& type) const {
 }
 
 // --- presets ----------------------------------------------------------------
+bool QmlPlayerBridge::installNativePlaybackPresets() {
+    auto& library=impl_->facade.presets();
+    if(library.corrupt()) { emit notice(tr("预设库损坏，原文件保留，未添加方案"),true);return false; }
+    unsigned added=0;
+    for(const auto& preset:engine::sourcePlaybackPresets(impl_->sourceSettings(false), impl_->sourceSettings(true))) {
+        const auto& entries=library.entries();
+        if(std::any_of(entries.begin(),entries.end(),[&](const auto& e){return e.name==preset.entry.name;}))continue;
+        if(!library.put(preset.entry,false)) {
+            emit presetsChanged();emit notice(uiText(library.error()),true);return false;
+        }
+        ++added;
+    }
+    emit presetsChanged();
+    veyra::log::info("native-presets",std::format("added={} preserveExisting=1 defaultUnchanged=1",added));
+    emit notice(tr("已添加本地与浏览器方案；已有自定义预设保留"),false);
+    return true;
+}
+bool QmlPlayerBridge::selectNativePlaybackPreset(const QString& id) {
+    auto choices=engine::nativePlaybackPresets();
+    for (auto& choice : engine::sourcePlaybackPresets(impl_->sourceSettings(false), impl_->sourceSettings(true)))
+        choices.push_back(std::move(choice));
+    const auto wanted=std::find_if(choices.begin(),choices.end(),[&](const auto& p){return QString::fromStdString(p.id)==id;});
+    if(wanted==choices.end()) { emit notice(tr("未知的本地播放方案"),true);return false; }
+    if(impl_->chain.mode!=engine::ChainMode::List) {
+        veyra::log::error("native-presets","reference profiles require list mode; saved node session retained; use a fresh --data-dir for isolated tests");
+        emit notice(tr("本地初始方案用于列表模式，请先切换到列表"),true);return false;
+    }
+    auto& library=impl_->facade.presets();
+    if(library.corrupt()) {
+        veyra::log::error("native-presets","preset library is corrupt; original files retained");
+        emit notice(tr("预设库损坏，原文件保留"),true);return false;
+    }
+    const auto present=std::find_if(library.entries().begin(),library.entries().end(),
+        [&](const auto& e){return e.name==wanted->entry.name;});
+    if(present==library.entries().end()) {
+        if(!library.put(wanted->entry,false)) {
+            veyra::log::error("native-presets","requested profile could not be added");
+            emit notice(uiText(library.error()),true);return false;
+        }
+        emit presetsChanged();
+    }
+    const auto& entries=library.entries();
+    for(size_t i=0;i<entries.size();++i)if(entries[i].name==wanted->entry.name) {
+        if(!(entries[i]==wanted->entry)) {
+            emit notice(tr("同名方案已修改，保留用户版本；请用预设菜单手动选择"),true);
+            veyra::log::error("native-presets","named preset differs from the requested reference profile");
+            return false;
+        }
+        return applyPresetIndex(int(i));
+    }
+    return false;
+}
 bool QmlPlayerBridge::applyPresetIndex(int index) {
     if (index < 0 || size_t(index) >= impl_->facade.presets().entries().size()) return false;
     const auto mode = impl_->chain.mode;
@@ -5853,6 +6700,8 @@ bool QmlPlayerBridge::applyPresetIndex(int index) {
     }
     impl_->selectedNr = selectedNr;
     impl_->selectedColour = selectedColour;
+    if(entry.globals&&(entry.contents&engine::presetContentMask(engine::PresetContent::Chain))&&srFollowDisplay())
+        setSrFollowDisplay(false);
     if (entry.flow && (entry.contents & engine::presetContentMask(engine::PresetContent::Flow))) {
         impl_->prefs[QStringLiteral("contentRate")] = int(this->settings().content);
         if (!impl_->savePrefs()) veyra::log::warn("ui-prefs", "preset content cadence not saved");
@@ -6094,16 +6943,32 @@ void QmlPlayerBridge::startGpuSampler() {
 
 void QmlPlayerBridge::updateRunStatus() {
     auto& i = *impl_;
+    if (i.browser && i.browser->enabled()) {
+        const auto view = i.browser->telemetry();
+        if (!view.live) {
+            const QString status = view.last ? tr("已冻结") : tr("等待视频");
+            const bool changed = i.runStatus != status || i.runLevel != QLatin1String("idle");
+            i.runStatus = status; i.runLevel = QStringLiteral("idle");
+            if (!view.last) {
+                i.history = {}; i.frameTimes.clear(); i.rateRatio = -1.0; i.runDetail.clear();
+            }
+            // Do not repeat the frozen sample into history or let the engine's
+            // Empty transition erase the last browser measurement.
+            if (changed) emit perfChanged();
+            return;
+        }
+    }
     const auto& s = i.snapshot;
     i.history.sample(s);
     const auto& f = s.metrics.flow;
     const bool active = s.running && !s.image && s.transport == engine::TransportState::Playing;
+    const bool localComparison = !(i.browser && i.browser->enabled()) && i.compareMode != 0;
     QString status = tr("待机"), level = QStringLiteral("idle");
     if (s.failed) { status = tr("错误"); level = QStringLiteral("err"); }
     else if (s.remoteRecovering) { status = tr("恢复中"); level = QStringLiteral("warn"); }
     // Comparison pauses frame generation by design; the output then runs at the source
     // rate, which the rate check would call 输出未达标 (a field user read that as broken FG).
-    else if (active && i.compareMode != 0 && s.applied.multiplier > 1) { status = tr("对比中"); level = QStringLiteral("ok"); }
+    else if (active && localComparison && s.applied.multiplier > 1) { status = tr("对比中"); level = QStringLiteral("ok"); }
     else if (active && !s.applying && f.rateWindowReady) {
         // Judged on the engine's own words, shown in the interface language.
         const std::wstring rate = i.history.rateStatus(s);
@@ -6128,7 +6993,7 @@ void QmlPlayerBridge::updateRunStatus() {
                           .arg(backend);
         }
         else detail << tr("未补帧");
-        if (s.applied.multiplier > 1 && impl_->compareMode != 0) detail << tr("补帧暂停");
+        if (s.applied.multiplier > 1 && localComparison) detail << tr("补帧暂停");
         else if (s.applied.multiplier > 1 && (s.fgBudgetLimited || s.xessGenerationSuppressed)) detail << tr("调度降档");
         if (s.nominalSourceFps > 0.01) detail << tr("源 %1 fps").arg(s.nominalSourceFps, 0, 'f', 2);
         const auto autoState=nrAutoStatus();if(!autoState.isEmpty())detail<<autoState;
@@ -6141,7 +7006,7 @@ void QmlPlayerBridge::updateRunStatus() {
         const double source = measuredInput ? std::min(s.nominalSourceFps, s.captureFps) : s.nominalSourceFps;
         const bool xessSink = s.applied.multiplier > 1 && engine::presentSinkFrameGeneration(s.applied.frameGenerationBackend);
         const double actual = xessSink ? f.xessSdkSubmitFps : f.presentSubmitFps;
-        const double target = source * (s.captureHalfRate ? 0.5 : 1.0) * (i.compareMode != 0 ? 1u : s.applied.multiplier);
+        const double target = source * (s.captureHalfRate ? 0.5 : 1.0) * (localComparison ? 1u : s.applied.multiplier);
         if (target > 0) ratio = actual / target;
     }
     const bool ratioChanged = std::abs(ratio - i.rateRatio) > 0.005;
@@ -6376,7 +7241,9 @@ QString QmlPlayerBridge::presentationStatus() const { return uiText(impl_->snaps
 void QmlPlayerBridge::applyPresentation() {
     auto& p = impl_->presentation;
     if (!p.valid()) return;
-    impl_->engine.requestPresentation(p);
+    if(impl_->browser&&impl_->browser->enabled())
+        impl_->browser->configure(engine::PlayerOptions::from(settings(),engine::runtimeOrder(impl_->activeRuntime())),p);
+    else impl_->engine.requestPresentation(p);
     impl_->prefs[QStringLiteral("presentation")] = QVariantMap{
         {"lowQueue", p.enabled}, {"display", int(p.display)}, {"outputRate", int(p.outputRate)}, {"customFps", p.customFps}};
     if (!impl_->savePrefs()) veyra::log::warn("ui-prefs", "presentation settings not saved");
@@ -6389,30 +7256,38 @@ void QmlPlayerBridge::applyPresentation() {
 // --- design gap B8-B11: compare and aspect ------------------------------------
 int QmlPlayerBridge::compareMode() const { return impl_->compareMode; }
 void QmlPlayerBridge::setCompareMode(int value) {
+    // Browser monitoring owns its independent side-output comparison controls.
+    // Ignore legacy/local actions before touching the saved native-player mode.
+    if (sourceKind() == QStringLiteral("browser")) return;
     if (value < 0 || value > 2 || impl_->compareMode == value) return;
     impl_->compareMode = value;
-    if (!impl_->holdKeyDown) impl_->engine.comparison(value, impl_->compareBase, float(impl_->compareSplit));
+    if (!impl_->holdKeyDown && !(impl_->browser && impl_->browser->enabled()))
+        impl_->engine.comparison(value, impl_->compareBase, float(impl_->compareSplit));
     veyra::log::info("ui-compare", std::format("mode={} base={} split={:.3f}", value, impl_->compareBase, impl_->compareSplit));
     // Comparison shows real frames only (a generated frame has no original to set beside
     // it), so frame generation pauses while it is on. A field user left split compare on
     // for 24 minutes and reported "补帧无效" (logs9, 2026-10-01): say so.
-    if (value != 0 && impl_->snapshot.running && impl_->snapshot.applied.multiplier > 1)
+    if (value != 0 && !(impl_->browser && impl_->browser->enabled()) &&
+        impl_->snapshot.running && impl_->snapshot.applied.multiplier > 1)
         emit notice(tr("对比模式下补帧暂停（对比只能用真实帧），关闭对比后自动恢复"), false);
     emit compareChanged();
 }
 bool QmlPlayerBridge::compareBase() const { return impl_->compareBase; }
 void QmlPlayerBridge::setCompareBase(bool value) {
+    if (sourceKind() == QStringLiteral("browser")) return;
     if (impl_->compareBase == value) return;
     impl_->compareBase = value;
-    if (!impl_->holdKeyDown) impl_->engine.comparison(impl_->compareMode, value, float(impl_->compareSplit));
+    if (!impl_->holdKeyDown && !(impl_->browser && impl_->browser->enabled()))
+        impl_->engine.comparison(impl_->compareMode, value, float(impl_->compareSplit));
     emit compareChanged();
 }
 double QmlPlayerBridge::compareSplit() const { return impl_->compareSplit; }
 void QmlPlayerBridge::setCompareSplitAt(double fx) {
+    if (sourceKind() == QStringLiteral("browser")) return;
     // 1.4.4 AppShell: the split is a fraction of the displayed picture, which is
     // letterboxed and may be zoomed/panned inside the host.
     auto& i = *impl_;
-    if (!i.videoWindow || !std::isfinite(fx)) return;
+    if ((i.browser && i.browser->enabled()) || !i.videoWindow || !std::isfinite(fx)) return;
     RECT r{}; GetClientRect(i.videoWindow, &r);
     if (r.right < 1 || r.bottom < 1) return;
     const auto e = i.snapshot.metrics.resolution.output;
@@ -6434,6 +7309,7 @@ void QmlPlayerBridge::setAspectMode(int value) {
     emit compareChanged();
 }
 void QmlPlayerBridge::applyAspect(bool force) {
+    if(impl_->browser&&impl_->browser->enabled())return;
     auto& i = *impl_;
     const int mode = i.screenFillActive ? 2 : i.aspectMode;
     if (!i.videoWindow) return;
@@ -6602,13 +7478,17 @@ bool QmlPlayerBridge::resetNrLayer(int index) {
 
 QVariantList QmlPlayerBridge::frameTimes() const {
     QVariantList out;
-    for (const double v : impl_->frameTimes) out << v;
+    if(impl_->displayMonitor){
+        const auto points=impl_->displayMonitor->frameDurations();
+        for(size_t n=points.size()>48?points.size()-48:0;n<points.size();++n)out<<points[n];
+    }
     return out;
 }
 
 // --- P5 (2026-09-29): headers, colour history, export rows, presets -------
 QString QmlPlayerBridge::sourceKind() const {
     const auto& s = impl_->snapshot;
+    if (impl_->browser && impl_->browser->enabled()) return QStringLiteral("browser");
     if (!hasSource()) return {};
     if (s.image) return QStringLiteral("image");
     if (s.remotePlay) return QStringLiteral("ps5");
@@ -6619,6 +7499,7 @@ QString QmlPlayerBridge::sourceKind() const {
 QString QmlPlayerBridge::sourceTitle() const {
     const QString kind = sourceKind();
     if (kind.isEmpty()) return {};
+    if (kind == QLatin1String("browser")) return tr("浏览器视频");
     if (kind == QLatin1String("file") || kind == QLatin1String("image")) return sourceName();
     if (kind == QLatin1String("capture")) {
         const QString name = impl_->prefString("captureDeviceName");
@@ -6641,6 +7522,15 @@ QString QmlPlayerBridge::sourceRateText() const {
         .arg(whole ? QString::number(int(std::round(fps))) : QString::number(fps, 'f', 2));
 }
 QString QmlPlayerBridge::sourceFormatText() const {
+    if (sourceKind() == QLatin1String("browser")) {
+        const auto view = impl_->browser->telemetry();
+        const auto& source = view.source;
+        if (!source.originalWidth || !source.originalHeight) return tr("等待浏览器视频");
+        QString text = tr("原视频 %1×%2").arg(source.originalWidth).arg(source.originalHeight);
+        if (std::isfinite(source.originalFps) && source.originalFps > 0)
+            text += tr(" · %1 fps").arg(source.originalFps, 0, 'f', 2);
+        return text;
+    }
     QStringList parts;
     const QString rate = sourceRateText();
     if (rate.isEmpty()) return {};

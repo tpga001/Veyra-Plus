@@ -29,6 +29,7 @@ bool TiledImageProcessor::process(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotR
     desc.sourceWidth=desc.workWidth=desc.nrWidth=tileW;
     desc.sourceHeight=desc.workHeight=desc.nrHeight=tileH;
     desc.rgbInput=true;desc.stillImage=true;desc.enableFg=false;desc.enableNvofStandalone=false;
+    desc.beauty.enabled=false; // Stage11 video-only, including direct tiled callers
     pipeline::EnhanceGraph graph(ctx,ring);
     if(!graph.initialize(desc)||!graph.createViews())return false;
     AVFrame* raw=av_frame_alloc();
@@ -59,6 +60,7 @@ bool TiledImageProcessor::process(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotR
         // Protection is tile-local; grading remains the same ordered chain as
         // the full image. Default colour settings would reject an enabled grade
         // (or a nonempty additional chain) before the first tile is processed.
+        tileSettings.beauty=desc.beauty;tileSettings.beauty.enabled=false;
         tileSettings.color=desc.color;tileSettings.additionalColors=desc.additionalColors;
         tileSettings.additionalColorCount=desc.additionalColorCount;
         for(auto& q:tileSettings.protection.regions){

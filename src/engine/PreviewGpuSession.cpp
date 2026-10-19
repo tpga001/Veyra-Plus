@@ -24,7 +24,7 @@ bool PreviewGpuSession::initialize(unsigned slots){
 bool PreviewGpuSession::requestAllowed(const EnhancementSettings& settings){
     return settings.validate().empty()&&(settings.nr||settings.sr)&&settings.multiplier==1&&
         settings.nrRuntime==NrRuntime::Original&&settings.activeNrLayerCount()<=1&&!settings.activeAutoNrLayerCount()&&
-        !settings.videoHdr.enabled&&!settings.color.enabled&&settings.additionalColorCount==0&&
+        !settings.videoHdr.enabled&&!settings.beauty.enabled&&!settings.color.enabled&&settings.additionalColorCount==0&&
         (settings.videoSrQuality==0||settings.videoSrQuality==4);
 }
 bool PreviewGpuSession::computeAllowed(const gfx::AdapterInfo& adapter,const pipeline::EnhanceGraphDesc& desc){
@@ -37,7 +37,7 @@ bool PreviewGpuSession::computeAllowed(const gfx::AdapterInfo& adapter,const pip
         desc.nrRuntime==NrRuntime::Original&&desc.nrLayersExtent.size()==2&&
         desc.nrLayersExtent[0]==pipeline::Extent{1920,1080}&&desc.nrLayersExtent[1]==pipeline::Extent{1920,1080}&&
         !desc.nrBeforeSr&&!desc.runtimeNodeOrder&&!desc.hdrInput&&!desc.hdrOutput&&!desc.videoHdr.enabled&&
-        !desc.color.enabled&&!desc.additionalColorCount&&!desc.nrHoldStrength&&
+        !desc.beauty.enabled&&!desc.color.enabled&&!desc.additionalColorCount&&!desc.nrHoldStrength&&
         !desc.nrTemporal&&std::none_of(desc.nrLayersTemporal.begin(),desc.nrLayersTemporal.end(),[](bool enabled){return enabled;})&&
         desc.opticalFlowBackend==OpticalFlowBackend::Nvidia&&desc.enableFg&&
         desc.frameGenerationBackend==FrameGenerationBackend::Dlss&&(desc.fgMultiplier==2||desc.fgMultiplier==3);

@@ -67,8 +67,8 @@ if ([version]$Version -ge [version]'1.3.1') {
 }
 if ([version]$Version -ge [version]'1.1.1') {
   if ([version]$Version -ge [version]'2.0.0') {
-    # SF-v2 is the RTX20-50 compatible choice; the disk slot name is historical.
-    $runtimeFiles += @{ Name='nvngx_dlssnr.dll'; Folder='runtime/experimental/nr-ampere'; Source='runtime_local/nvidia/nr-ampere/nvngx_dlssnr.dll'; Hash='6EB209E764F39872625DEBD6ABAF45E2BB6322F6F270F781F70C059AE30B3927'; Signature='NotSigned'; Size=165830144; Version='310.8.2.0'; Category='user-approved-community-SF-v2-310.8.2-RTX20-RTX50-compatible-runtime'; Experimental=$true }
+    # SF310.9.16 is the locally validated replacement; the disk slot name is historical.
+    $runtimeFiles += @{ Name='nvngx_dlssnr.dll'; Folder='runtime/experimental/nr-ampere'; Source='runtime_local/nvidia/nr-ampere/nvngx_dlssnr.dll'; Hash='CDFA6C1EC784867182164C7836F324F087B5C9F374D0C9FE46F54999FEABF3ED'; Signature='NotSigned'; Size=276162560; Version='310.9.16.0'; Category='user-approved-community-SF310.9.16-RTX3080-locally-validated-experimental-runtime'; Experimental=$true }
   } else {
     $runtimeFiles += @{ Name='nvngx_dlssnr.dll'; Folder='runtime/experimental/nr-ampere'; Source='runtime_local/nvidia/nr-ampere/nvngx_dlssnr.dll'; Hash='DCC0DC2414AEDEC4A8E084647070383BE068554042587180C20C784D4772D36F'; Signature='HashMismatch'; Size=165840496; Version='310.8.0.0'; Category='user-provided-NeuralScreen-1.8.2-modified-RTX30-experimental-runtime'; Experimental=$true }
   }

@@ -28,6 +28,7 @@ enum class EffectType : uint8_t {
     Protection,         // keeps NR out of chosen rectangles
     VideoHdr,           // SDR -> HDR conversion
     FrameGeneration,    // must be the last node
+    Beauty = 6,         // fixed SDR tail, before Video HDR and frame generation
     Count
 };
 constexpr uint32_t effectTypeCount = uint32_t(EffectType::Count);
@@ -39,6 +40,7 @@ constexpr std::string_view effectTypeName(EffectType type) {
     case EffectType::Protection: return "protection";
     case EffectType::VideoHdr: return "video-hdr";
     case EffectType::FrameGeneration: return "frame-generation";
+    case EffectType::Beauty: return "beauty";
     case EffectType::Count: break;
     }
     return "unknown";
@@ -71,6 +73,7 @@ struct ChainNode {
     ProtectionSettings protection{};
     ColorSettings color{};
     VideoHdrSettings videoHdr{};
+    BeautySettings beauty{};
     bool operator==(const ChainNode&) const = default;
 };
 
@@ -165,6 +168,7 @@ struct ChainExecutionRequest {
     bool stillImage = false;
     bool exportJob = false;
     bool amdNrExport = false; // bounded internal model input, full-size output
+    pipeline::Extent srPlaybackExtent{}; // runtime-only physical display limit
 };
 struct ChainExecutionStep {
     EffectType type = EffectType::NrEnhance;

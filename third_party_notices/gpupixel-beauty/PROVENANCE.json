@@ -1,0 +1,25 @@
+{
+  "upstream": "https://github.com/pixpark/gpupixel",
+  "localCheckoutHead": "fd596da4d50bc8035c32f0b400af70536dc59e4f",
+  "license": "Apache-2.0",
+  "files": {
+    "src/filter/beauty_face_unit_filter.cc": "c0fb1f89f2a4083dc30def7090c75a25068a95d69e57cb02526b86cf8f2c21da",
+    "src/filter/box_mono_blur_filter.cc": "2cbd33472f2fc9a332ba4ffdcda1c132e5d898fbff2674c51b740d1ae5ea6385",
+    "src/filter/box_difference_filter.cc": "f0938a21dc72f8649bc536d3d434ef4793d86ca61a7c552f6294d8cd48e0e1f1",
+    "src/filter/beauty_face_filter.cc": "f85bf269de6867dcb764d83635b7de64d245f0110fb7dc0710cb24f801505389",
+    "src/filter/box_high_pass_filter.cc": "87e959d24a3e8d5930d1fa5953bda4407976e47aad6bd3a2f3088ef95974718f",
+    "src/res/lookup_gray.png": "9b7b6da3f0d6102dfd454119c108cc5b56e97176eda4c01871b5dfdcd256952b",
+    "src/res/lookup_origin.png": "b6e8799049eb14482b544861bb444733c22768965f69545893fa8485e85207af",
+    "src/res/lookup_skin.png": "5f898a8fe4997b4831c3c7a29fadd4b307f0bb9dc837a7cc5c6d3f2b870b55f5",
+    "src/res/lookup_light.png": "5058b32f12f584152c1a5984767415bdeb128e0ea78c858f3529ba596ba06d3a"
+  },
+  "changes": "GLSL basic beauty equations ported to HLSL; SDR transfer explicit; input alpha preserved; FP16 source and output; RGBA8 blur/variance rounding modeled; no face models or detector. Stage12 whitening: continuous overall encoded-domain strength for the complete four-LUT sequence; zero bypass; unchanged full-strength endpoint.",
+  "whiteningControl": {
+    "updated": "2026-10-14",
+    "scope": "Veyra adaptation of basic shader control; no LUT asset edits",
+    "zero": "exact whitening bypass; no whitening LUT sampling at zero",
+    "one": "original complete four-LUT full-strength endpoint",
+    "between": "blend encoded pre-whitening input with complete full-strength result using the persisted whitening value",
+    "schemaChanged": false
+  }
+}

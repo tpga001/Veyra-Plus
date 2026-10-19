@@ -89,8 +89,8 @@ $nrSlots = @(
      Sha = 'F95FEB54137EA11979F9B4EC4F00AFD84B5C98A5624D3388FBF6A87714A39FCC'; Size = 165840496; Sig = 'HashMismatch'
      Class = 'user-approved-community-Lecram-310.8.3-RTX50-runtime'; Source = 'community Lecram 310.8.3 (RankFTW/rhi-repo dlssnr-310.8.Lecram)' },
   @{ Given = $NrAmpereRuntime; Folder = 'experimental\nr-ampere'; Path = 'runtime/experimental/nr-ampere/nvngx_dlssnr.dll'
-     Sha = '6EB209E764F39872625DEBD6ABAF45E2BB6322F6F270F781F70C059AE30B3927'; Size = 165830144; Sig = 'NotSigned'
-     Class = 'user-approved-community-SF-v2-310.8.2-RTX20-RTX50-compatible-runtime'; Source = 'community SF-v2 310.8.2 (RankFTW/rhi-repo dlssnr-310.8.SF-v2)' }
+     Sha = 'CDFA6C1EC784867182164C7836F324F087B5C9F374D0C9FE46F54999FEABF3ED'; Size = 276162560; Sig = 'NotSigned'
+     Class = 'user-approved-community-SF310.9.16-RTX3080-locally-validated-experimental-runtime'; Source = 'https://github.com/Likely7/Veyra-NRVideo/releases/download/v2.0.9/Veyra-2.0.9-NVIDIA-win64-portable.zip (Veyra-2.0.9-test-NVIDIA-win64-portable/runtime/experimental/nr-ampere/nvngx_dlssnr.dll)' }
 ) | Where-Object { $_.Given }
 if ($nrSlots) {
   # A copied runtime keeps the release untouched while one slot is replaced.

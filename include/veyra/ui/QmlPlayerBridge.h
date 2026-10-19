@@ -1,4 +1,5 @@
 #pragma once
+#include "veyra/ui/VideoOutputPublisher.h"
 // The QML front end's only view of the player.
 //
 // Design rules this file follows, all of them deliberate:
@@ -38,11 +39,21 @@
 class QQmlEngine;
 namespace veyra::ui {
 
+class OnlineSubtitleService;
 class MoonlightModel;
 class XboxModel;
 
 class QmlPlayerBridge : public QObject {
     Q_OBJECT
+    Q_PROPERTY(bool browserEnabled READ browserEnabled WRITE setBrowserEnabled NOTIFY browserChanged)
+    Q_PROPERTY(bool browserListening READ browserListening NOTIFY browserChanged)
+    Q_PROPERTY(QString browserStatus READ browserStatus NOTIFY browserChanged)
+    Q_PROPERTY(QVariantMap browserDiagnostics READ browserDiagnostics NOTIFY browserChanged)
+    Q_PROPERTY(QVariantMap browserTelemetry READ browserTelemetry NOTIFY browserChanged)
+    Q_PROPERTY(QVariantMap browserPreview READ browserPreview NOTIFY browserPreviewChanged)
+    // Browser monitoring comparison is independent from the player's global comparison.
+    Q_PROPERTY(int browserPreviewComparisonMode READ browserPreviewComparisonMode WRITE setBrowserPreviewComparisonMode NOTIFY browserPreviewChanged)
+    Q_PROPERTY(double browserPreviewComparisonSplit READ browserPreviewComparisonSplit WRITE setBrowserPreviewComparisonSplit NOTIFY browserPreviewChanged)
     // --- professional-page readouts ---------------------------------------
     // Every one of these reports an engine value. Where the engine has no
     // measurement the getter says so (e.g. displayFpsKnown stays false, because
@@ -50,8 +61,9 @@ class QmlPlayerBridge : public QObject {
     // design requires exactly this distinction rather than reusing submit FPS).
     Q_PROPERTY(QString outputSummary READ outputSummary NOTIFY snapshotChanged)
     Q_PROPERTY(bool fullscreenMemorySafe READ fullscreenMemorySafe NOTIFY snapshotChanged)
-    Q_PROPERTY(double displayFps READ displayFps NOTIFY snapshotChanged)
-    Q_PROPERTY(bool displayFpsKnown READ displayFpsKnown NOTIFY snapshotChanged)
+    Q_PROPERTY(double displayFps READ displayFps NOTIFY displayMetricsChanged)
+    Q_PROPERTY(bool displayFpsKnown READ displayFpsKnown NOTIFY displayMetricsChanged)
+    Q_PROPERTY(QVariantMap displayMetrics READ displayMetrics NOTIFY displayMetricsChanged)
     Q_PROPERTY(double queuedFrames READ queuedFrames NOTIFY snapshotChanged)
     Q_PROPERTY(bool queuedFramesKnown READ queuedFramesKnown NOTIFY snapshotChanged)
     Q_PROPERTY(int skippedFrames READ skippedFrames NOTIFY snapshotChanged)
@@ -187,7 +199,9 @@ class QmlPlayerBridge : public QObject {
     Q_PROPERTY(QString uiLanguage READ uiLanguage NOTIFY preferencesChanged)
     Q_PROPERTY(QString screenshotDirectory READ screenshotDirectory NOTIFY preferencesChanged)
     Q_PROPERTY(QString lastScreenshot READ lastScreenshot NOTIFY preferencesChanged)
+    Q_PROPERTY(bool browserHostAvailable READ browserHostAvailable CONSTANT)
     Q_PROPERTY(QString dataDirectory READ dataDirectory CONSTANT)
+    Q_PROPERTY(QObject* onlineSubtitles READ onlineSubtitles CONSTANT)
     // Rebindable shortcuts: action -> key sequence text (defaults merged in).
     Q_PROPERTY(QVariantMap shortcuts READ shortcuts NOTIFY preferencesChanged)
     // The interface scale chosen for the next start (0 = follow Windows).
@@ -271,6 +285,13 @@ class QmlPlayerBridge : public QObject {
     Q_PROPERTY(bool nrTemporal READ nrTemporal WRITE setNrTemporal NOTIFY settingsChanged)
     Q_PROPERTY(double nrHoldStrength READ nrHoldStrength WRITE setNrHoldStrength NOTIFY settingsChanged)
     Q_PROPERTY(double nrHoldTolerance READ nrHoldTolerance WRITE setNrHoldTolerance NOTIFY settingsChanged)
+    // Basic SDR beauty, ported from GPUPixel. Strengths are live uniforms;
+    // the singleton remains a normal chain/preset setting, never a capture loop.
+    Q_PROPERTY(bool beautyEnabled READ beautyEnabled WRITE setBeautyEnabled NOTIFY settingsChanged)
+    Q_PROPERTY(double beautySmoothing READ beautySmoothing WRITE setBeautySmoothing NOTIFY settingsChanged)
+    Q_PROPERTY(double beautyWhitening READ beautyWhitening WRITE setBeautyWhitening NOTIFY settingsChanged)
+    Q_PROPERTY(double beautyDetail READ beautyDetail WRITE setBeautyDetail NOTIFY settingsChanged)
+    Q_PROPERTY(QVariantMap beautyMetrics READ beautyMetrics NOTIFY snapshotChanged)
     Q_PROPERTY(bool videoHdr READ videoHdr WRITE setVideoHdr NOTIFY settingsChanged)
     Q_PROPERTY(QVariantMap videoHdrParams READ videoHdrParams NOTIFY chainChanged)
     // Custom: static HDR output tuning (globals, every field live).
@@ -313,7 +334,7 @@ class QmlPlayerBridge : public QObject {
     // Achieved output rate / target (source x multiplier); -1 while unknown.
     Q_PROPERTY(double outputRateRatio READ outputRateRatio NOTIFY perfChanged)
     // Frame interval history (ms, newest last) for the frame-time line.
-    Q_PROPERTY(QVariantList frameTimes READ frameTimes NOTIFY perfChanged)
+    Q_PROPERTY(QVariantList frameTimes READ frameTimes NOTIFY displayMetricsChanged)
     // 补帧 / 光流 (design gap A1-A5): motion estimation quality 0 性能 1 平衡 2 质量,
     // AMD half-resolution flow, content cadence (engine::ContentRate order).
     Q_PROPERTY(int flowQuality READ flowQuality WRITE setFlowQuality NOTIFY settingsChanged)
@@ -344,7 +365,7 @@ class QmlPlayerBridge : public QObject {
     // 继续上次: {kind: capture|ps5|screen, label, summary}; empty when none.
     Q_PROPERTY(QVariantMap lastSource READ lastSource NOTIFY preferencesChanged)
     // P5 (2026-09-29): what is playing, for the page headers.
-    // sourceKind: "" | file | image | capture | ps5 | screen.
+    // sourceKind: "" | file | image | capture | ps5 | screen | browser.
     Q_PROPERTY(QString sourceKind READ sourceKind NOTIFY snapshotChanged)
     Q_PROPERTY(QString sourceTitle READ sourceTitle NOTIFY snapshotChanged)
     // "1080p60 · YUY2 · SDR": reported values only.
@@ -402,7 +423,7 @@ class QmlPlayerBridge : public QObject {
     Q_PROPERTY(QVariantList presets READ presets NOTIFY presetsChanged)
     // The name of the preset currently in effect, or "自定义" when the
     // settings no longer match any stored preset. Derived, never guessed.
-    Q_PROPERTY(QString currentPresetName READ currentPresetName NOTIFY settingsChanged)
+    Q_PROPERTY(QString currentPresetName READ currentPresetName NOTIFY currentPresetNameChanged)
     Q_PROPERTY(QVariantList audioTracks READ audioTracks NOTIFY snapshotChanged)
     Q_PROPERTY(int selectedAudioTrack READ selectedAudioTrack WRITE setSelectedAudioTrack NOTIFY snapshotChanged)
     // The last capture session the user actually ran, for the home page's
@@ -449,6 +470,7 @@ class QmlPlayerBridge : public QObject {
     // of a picker that would change nothing.
     Q_PROPERTY(int srTargetIndex READ srTargetIndex WRITE setSrTargetIndex NOTIFY settingsChanged)
     Q_PROPERTY(QString srTargetLabel READ srTargetLabel NOTIFY settingsChanged)
+    Q_PROPERTY(bool srFollowDisplay READ srFollowDisplay WRITE setSrFollowDisplay NOTIFY settingsChanged)
     // Presets as a picker model: one preset concept, list and node together.
     Q_PROPERTY(QVariantList presetChoices READ presetChoices NOTIFY presetsChanged)
     // The design's save flow lists what the preset will contain before naming it:
@@ -484,11 +506,39 @@ public:
     // the preset library; empty means the default user data directory.
     QmlPlayerBridge(engine::EngineController& engine, std::filesystem::path dataDirectory = {},
                     QObject* parent = nullptr);
+    // Native dependency injection for isolated service tests. Production has no
+    // command-line, environment or QML endpoint override.
+    using OnlineSubtitleFactory = std::function<std::unique_ptr<OnlineSubtitleService>(QString)>;
+    QmlPlayerBridge(engine::EngineController& engine, std::filesystem::path dataDirectory,
+                    OnlineSubtitleFactory factory, QObject* parent = nullptr);
+    QmlPlayerBridge(engine::EngineController& engine, std::filesystem::path dataDirectory,
+                    OnlineSubtitleFactory factory, bool browserHost, QObject* parent = nullptr);
     ~QmlPlayerBridge() override;
+    bool browserHostAvailable() const;
+    VideoOutputSource videoOutputSource() const;
+    void setLocalFileLauncher(std::function<bool(const QString&)> launcher);
+    Q_INVOKABLE void launchLocalFile(const QString& path);
+
+    bool browserEnabled() const;
+    bool browserListening() const;
+    QString browserStatus() const;
+    QVariantMap browserDiagnostics() const;
+    Q_INVOKABLE void setBrowserEnabled(bool enabled);
+    // Desktop startup restoration is an internal transition, not a user edit.
+    void applyBrowserEnabled(bool enabled);
+    Q_INVOKABLE void openBrowserExtensionFolder();
+    QVariantMap browserTelemetry() const;
+    QVariantMap browserPreview() const;
+    int browserPreviewComparisonMode() const;
+    void setBrowserPreviewComparisonMode(int mode);
+    double browserPreviewComparisonSplit() const;
+    void setBrowserPreviewComparisonSplit(double split);
 
     QString outputSummary() const;
     double displayFps() const;
     bool displayFpsKnown() const;
+    QVariantMap displayMetrics() const;
+    Q_INVOKABLE void authorizeDisplayMonitor();
     double queuedFrames() const;
     bool queuedFramesKnown() const;
     int skippedFrames() const;
@@ -597,6 +647,7 @@ public:
     QString subtitleText() const;
     int subtitleBottomInset() const;
     void setSubtitleBottomInset(int value);
+    QObject* onlineSubtitles() const;
     Q_INVOKABLE void loadSubtitleDialog();
     Q_INVOKABLE bool loadSubtitleFile(const QString& path);
     Q_INVOKABLE void nudgeSubtitle(int deltaMs);
@@ -747,6 +798,16 @@ public:
     void setNrHoldStrength(double value);
     double nrHoldTolerance() const;
     void setNrHoldTolerance(double value);
+    bool beautyEnabled() const;
+    void setBeautyEnabled(bool enabled);
+    double beautySmoothing() const;
+    void setBeautySmoothing(double value);
+    double beautyWhitening() const;
+    void setBeautyWhitening(double value);
+    double beautyDetail() const;
+    void setBeautyDetail(double value);
+    QVariantMap beautyMetrics() const;
+    Q_INVOKABLE bool setBeautyParameter(const QString& key, double value);
     bool videoHdr() const;
     void setVideoHdr(bool value);
     bool hdrCurve() const;
@@ -951,6 +1012,9 @@ public:
     void setExportTrimEnd(double seconds);
     int srTargetIndex() const;
     QString srTargetLabel() const;
+    bool srFollowDisplay() const;
+    void setSrFollowDisplay(bool);
+    Q_INVOKABLE void refreshPlaybackDisplay(bool force=false);
     void setSrTargetIndex(int index);
     QVariantList presetChoices() const;
     QVariantList presetSaveParts() const;
@@ -985,6 +1049,11 @@ public:
     // window of the QML window and hands it over; the bridge never draws QML
     // into it and Qt never touches its swapchain.
     void attachVideoWindow(qulonglong nativeHandle);
+    // Exact top-level QQuickWindow supplied by the application. The native
+    // video child is initially an unparented popup and cannot identify it.
+    void setBrowserMonitorWindow(qulonglong nativeHandle);
+    // In-process target supplied only by the native UI host, never by QML/HTTP.
+    void setBrowserPreviewTarget(qulonglong nativeHandle, bool visible);
 
     // Run immediately before the engine opens a source. The presenter reads the
     // host window's client size once, when it initialises, and builds the
@@ -999,6 +1068,7 @@ public:
     Q_INVOKABLE void openFileDialog();
     Q_INVOKABLE void openPath(const QString& path);
     Q_INVOKABLE void openCaptureDialog();
+    Q_INVOKABLE void openBrowserDialog();
     // Reopens the last capture session with the same device and format.
     Q_INVOKABLE void resumeCaptureSession();
     Q_INVOKABLE void openPs5Dialog();
@@ -1059,6 +1129,8 @@ public:
 
     // Presets. A preset carries selected parts, so there is one preset concept,
     // not several.
+    Q_INVOKABLE bool installNativePlaybackPresets();
+    Q_INVOKABLE bool selectNativePlaybackPreset(const QString& id);
     Q_INVOKABLE bool applyPresetIndex(int index);
     Q_INVOKABLE bool selectExportPreset(int index);
     Q_INVOKABLE bool savePresetAs(const QString& name, int contentsMask, bool nodeMode);
@@ -1078,6 +1150,10 @@ public:
     Q_INVOKABLE void copyDiagnostics();
 
 signals:
+    void browserChanged();
+    void browserPreviewChanged();
+    void residentBrowserRequested();
+    void browserUserPreferenceChanged(bool enabled);
     void nodeAnchorsChanged();
     void ps5Changed();
     void moonlightUiChanged();
@@ -1090,6 +1166,7 @@ signals:
     // Emitted only when the underlying snapshot actually changed, so QML
     // bindings do not re-evaluate 60 times a second for nothing.
     void snapshotChanged();
+    void displayMetricsChanged();
     void perfChanged();
     void protectionDrawChanged();
     void presentationChanged();
@@ -1102,6 +1179,7 @@ signals:
     void chainChanged();
     void recentFilesChanged();
     void presetsChanged();
+    void currentPresetNameChanged();
     void exportChanged();
     // Emitted when the capture device or screen-target lists are re-enumerated.
     void captureChanged();

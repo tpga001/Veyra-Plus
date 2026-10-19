@@ -69,7 +69,7 @@ struct SubtitleTrack {
     std::vector<SubtitleStyle> styles;
     std::vector<SubtitleCue> cues;
     std::vector<double> starts;   // parallel to cues; sorted, for binary search
-    int offsetMs=0;               // viewer offset (per track, not persisted)
+    int offsetMs=0;               // positive delays cues; per track, not persisted
     double scriptWidth=1920,scriptHeight=1080; // ASS PlayRes, for \pos scaling
     bool usable() const {return !cues.empty();}
     void rebuildIndex();
@@ -77,6 +77,10 @@ struct SubtitleTrack {
 
 // Format is chosen from the file extension first, then sniffed from content.
 SubtitleTrack loadSubtitleFile(const std::wstring& path);
+// Same-directory sidecars: exact media stem or a recognized language suffix.
+// Bounded, deterministic and cancellable; malformed files do not hide valid tracks.
+std::vector<SubtitleTrack> loadExternalSubtitleTracks(const std::wstring& mediaPath,std::stop_token stop={});
+
 
 // Subtitle tracks inside the container (Matroska/MP4/...).
 std::vector<SubtitleTrack> loadEmbeddedSubtitleTracks(const std::wstring& path,std::stop_token stop={},
@@ -101,7 +105,8 @@ std::vector<const SubtitleCue*> cuesAt(const SubtitleTrack&,double seconds,size_
 std::wstring textAt(const SubtitleTrack&,double seconds);
 
 // Constant-offset alignment: correlates the file's speech activity with the
-// track's cue activity. Returns the shift to ADD to cue timestamps.
+// track's cue activity. Returns the total offset to ADD to cue timestamps,
+// including the track's existing offset (positive delays subtitles).
 struct SubtitleAlignResult { bool ok=false; int offsetMs=0; double score=0; std::wstring detail; };
 SubtitleAlignResult alignSubtitleToAudio(const std::wstring& mediaPath,const SubtitleTrack&,int maxShiftSeconds=30,std::stop_token stop={});
 

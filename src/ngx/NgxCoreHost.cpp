@@ -122,9 +122,13 @@ bool NgxCoreHost::initialize(ID3D12Device* device,
     }
 
     uint32_t sehCode = 0;
+    const auto initStarted = GetTickCount64();
+    veyra::log::info("ngx-init-timing", std::format("begin thread={}", GetCurrentThreadId()));
     const NVSDK_NGX_Result result = CallInitWithProjectId(projectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM,
         engineVersion, runtimeDir.c_str(), device, &common, NVSDK_NGX_Version_API, sehCode);
     initResult_ = static_cast<uint64_t>(result);
+    veyra::log::info("ngx-init-timing", std::format("end thread={} cpuElapsedMs={} result={} seh={}",
+        GetCurrentThreadId(), GetTickCount64() - initStarted, veyra::ngxResultString(initResult_), sehCode));
 
     veyra::log::info("ngx", std::format("core-host: Init_with_ProjectID result={} seh={} runtimeDirLen={} projectId={}",
         veyra::ngxResultString(initResult_), sehCode, runtimeDir.size(), projectId));

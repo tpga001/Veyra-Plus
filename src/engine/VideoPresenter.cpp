@@ -16,6 +16,9 @@ bool VideoPresenter::beginSourceProcessing(){
     auto* xess=sink_.xess();return !xess||(beginSourceInput()&&xess->beginProcessing(xessInputId_));
 }
 void VideoPresenter::sourceProcessed(pipeline::FrameIdentity identity){
+    // Authoritative identity from the CURRENT successful graph.process result,
+    // independent of the older frame being presented or its completion snapshot.
+    browserPreview_.sourceProcessed(identity);
     if(!xessInputId_)return;
     xessWork_[xessWorkPosition_]={identity,xessInputId_};
     xessWorkPosition_=(xessWorkPosition_+1)%xessWork_.size();xessInputId_=0;
@@ -178,6 +181,9 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& 
         const HRESULT hr=presentationQueue_->Wait(producerFence,graph.presentationReadyFence(slot,generated));
         if(FAILED(hr)){veyra::log::error("present",std::format("producer handoff wait hr=0x{:X}",unsigned(hr)));return false;}
     }
+    // The optional preview uses the SAME final graph handoff waited above.
+    // It never trusts an earlier frame-lease fence or starts a second graph.
+    const bool previewReady=!generated&&browserPreview_.prepare(ctx,ring.queue(),graph.outputFormat(),graph.hdrOutput(),window_);
     Status st=Status::Ok;uint32_t commandSlot=0;auto* list=ring.acquireNext(commandSlot,st);if(!list)return false;
     gpuTimer_.frame(identity.sourceFrameId?identity:pipeline::FrameIdentity{0,0,submittedCount()+1},fence);gpuTimer_.mark(list,diagnostics::GpuStage::Blit);
     uint32_t backBufferIndex=0;
@@ -227,6 +233,25 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& 
         if(comparison==2)rect.right=LONG(std::clamp((rc.right*.5f+(std::clamp(split,0.0f,1.0f)-view.centerX)*renderW)*sink_.bufferWidth()/rc.right,0.0f,float(sink_.bufferWidth())));list->RSSetScissorRects(1,&rect);list->DrawInstanced(3,1,0,0);
         std::swap(b.Transition.StateBefore,b.Transition.StateAfter);list->ResourceBarrier(1,&b);
         if(veyra::log::verboseFrameLogs())veyra::log::info("comparison",std::format("real-frame source={} epoch={} revision={} reference={} mode={} split={} (same leased frame)",identity.sourceFrameId,identity.epoch,identity.settingsRevision,baseReference?"base":"input",comparison,split));
+        if(comparison==2&&split>0.0f&&split<1.0f){
+            // The guide is a final display-only draw. Rebind the still-readable
+            // enhanced resource after restoring the reference and remove the
+            // left-half scissor so its handle can cross the actual divider.
+            rect={0,0,LONG(sink_.bufferWidth()),LONG(sink_.bufferHeight())};
+            list->RSSetScissorRects(1,&rect);
+            dims[2]=64.0f+(graph.hdrOutput()?8.0f:0.0f)+(graph.hdr10Output()?4.0f:0.0f);
+            dims[14]=split;dims[15]=std::max(1.0f,float(GetDpiForWindow(window_))/96.0f);
+            list->SetGraphicsRoot32BitConstants(0,16,dims,0);
+            list->SetGraphicsRootDescriptorTable(1,{pass_.heap->GetGPUDescriptorHandleForHeapStart().ptr+size_t(slot)*pass_.increment});
+            list->DrawInstanced(3,1,0,0);
+        }
+    }
+    if(previewReady){
+        const D3D12_GPU_DESCRIPTOR_HANDLE frameSrv{pass_.heap->GetGPUDescriptorHandleForHeapStart().ptr+size_t(slot)*pass_.increment};
+        const D3D12_GPU_DESCRIPTOR_HANDLE referenceSrv{
+            pass_.heap->GetGPUDescriptorHandleForHeapStart().ptr+size_t(pipeline::kOutputPoolSlots+slot)*pass_.increment};
+        browserPreview_.record(list,pass_,frameSrv,graph.workWidth(),graph.workHeight(),identity,graph.highQualityPresentation(),
+            graph.sourceReference(slot),referenceSrv,referencesValid);
     }
     for(auto& b:barriers)std::swap(b.Transition.StateBefore,b.Transition.StateAfter);list->ResourceBarrier(2,barriers);
     // Interpolation region for the XeSS present-sink FG backend.
@@ -309,10 +334,14 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& 
 
     gpuTimer_.mark(list,diagnostics::GpuStage::Blit,true);gpuTimer_.resolve(list);
     if(!ring.submitAndSignal(commandSlot))return false;gpuTimer_.submitted(ring.lastSignaledValue());lastBuffer_=backBufferIndex;hasPresented_=true;
+    browserPreview_.submitted(fence,ring.lastSignaledValue());
     if(presentationQueue_)graph.presentationSubmitted(slot,fence,ring.lastSignaledValue());
     const auto dxgiStart=std::chrono::steady_clock::now();
     reflex_.mark(reflexFrame_,3);reflex_.mark(reflexFrame_,4);
     const bool presented=sink_.present(st);
+    // Preserve XeSS tag-to-primary-Present ordering. Secondary Present cannot
+    // wait for display capacity; failures only disable the optional preview.
+    browserPreview_.present();
     reflex_.mark(reflexFrame_,5);reflexFrame_=0;
     const auto presentEnd=std::chrono::steady_clock::now();
     const auto ms=[](auto d){return std::chrono::duration<double,std::milli>(d).count();};
@@ -334,6 +363,11 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& 
     }
     xessFailed_=sink_.xessFailed();if(presented)retainedFrame_=retained;return presented;
 }
+bool VideoPresenter::readBrowserPreviewFrameForTest(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& ring,sink::RgbaImage& image){
+    if(presentationQueue_&&!presentationRing_.drainQueue())return false;
+    if(!ring.drainQueue())return false;
+    return browserPreview_.readPresentedFrameForTest(ctx,ring,image);
+}
 bool VideoPresenter::readPresentedFrameForTest(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& ring,sink::RgbaImage& image){
     if(presentationQueue_&&!presentationRing_.drainQueue())return false;
     if(!hasPresented_||!sink_.swapChain()||!ring.drainQueue())return false;
@@ -347,6 +381,7 @@ void VideoPresenter::close(){
     xessInputId_=0;xessWork_={};xessWorkPosition_=0;
     reflex_.close();reflexFrame_=0;
     if(presentationRing_.initialized())presentationRing_.drainQueue();
+    browserPreview_.close();
     hasPresented_=false;gpuTimer_.close();rtvs_.Reset();pass_={};sink_.shutdown();
     presentMotionPass_={};presentMotion_={};previousXessWidth_=previousXessHeight_=0;
     presentationRing_.shutdown();presentationFence_.Reset();presentationQueue_.Reset();

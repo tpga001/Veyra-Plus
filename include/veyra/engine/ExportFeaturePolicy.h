@@ -10,6 +10,8 @@ constexpr pipeline::NrSizePolicy exportNrSizePolicy(NrRuntime runtime) {
         ? pipeline::NrSizePolicy::Realtime : pipeline::NrSizePolicy::Native;
 }
 inline EnhancementSettings freezeExportSettings(EnhancementSettings settings) {
+    settings.srPlaybackExtent = {};
+    settings.videoSrInputExtent = {}; // A playback monitor must never resize an export.
     // Preserve invalid counts for the caller's validation; normalization must
     // not turn a corrupt settings transaction into an apparently valid one.
     if(settings.nrLayerCount>settings.nrLayers.size()||settings.additionalColorCount>settings.additionalColors.size())return settings;

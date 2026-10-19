@@ -9,7 +9,7 @@ namespace veyra::diagnostics {
 // spans above; they are never merged into enhancementProcessingMs.
 enum class GpuStage { Color, Sr, Flow, Nr, Residual, Fg1, Fg2, Fg3, Fg4, Fg5, Fg6, Fg7, FgBatch, Blit, VideoHdr,
     NrLayer0, NrLayer1, NrLayer2, NrLayer3,
-    ColorNode0, ColorNode1, ColorNode2, ColorNode3, ColorNode4, ColorNode5, Count };
+    ColorNode0, ColorNode1, ColorNode2, ColorNode3, ColorNode4, ColorNode5, Beauty, Count };
 static_assert(unsigned(GpuStage::Fg5)-unsigned(GpuStage::Fg1)==4);
 static_assert(unsigned(GpuStage::FgBatch)>unsigned(GpuStage::Fg7));
 static_assert(unsigned(GpuStage::Count)<=32,"GpuTimer keeps one mask bit per stage");
@@ -29,7 +29,8 @@ struct GpuFrameTiming {pipeline::FrameIdentity identity;std::array<GpuSample,siz
 // includes its dependency waits but excludes a late CPU completion poll.
 inline std::optional<double> graphExecutionSpanMs(const GpuFrameTiming& frame){
     uint64_t begin=UINT64_MAX,end=0,frequency=0;
-    for(size_t i=0;i<size_t(GpuStage::Blit);++i){
+    for(size_t i=0;i<size_t(GpuStage::Count);++i){
+        if(i==size_t(GpuStage::Blit))continue;
         const auto& s=frame.gpu[i];
         if(s.state!=SampleState::Measured)continue;
         if(!s.frequency||s.end<s.begin||(frequency&&frequency!=s.frequency))return {};

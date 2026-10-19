@@ -13,7 +13,7 @@ extern "C" {
 
 namespace veyra::engine {
 // Small RGBA8 preview of one decoded frame for the UI (minimal-mode bar).
-// Uses swscale, so every pixel format the decoder can hand us is covered.
+// Uses swscale for supported software formats; hardware surfaces are skipped.
 // Deliberately CPU-only and called once per open: it must never touch the
 // playback path or the GPU queue. Returns false when the frame cannot be
 // converted; callers keep an empty poster instead of a fake one.
@@ -21,6 +21,7 @@ bool makePosterFrame(const AVFrame* frame, uint32_t maxWidth, uint32_t maxHeight
                      std::vector<uint8_t>& rgba, uint32_t& width, uint32_t& height) {
     rgba.clear(); width = 0; height = 0;
     if (frame == nullptr || frame->width <= 0 || frame->height <= 0 || maxWidth == 0 || maxHeight == 0) return false;
+    if (!sws_isSupportedInput(static_cast<AVPixelFormat>(frame->format))) return false;
     const double scale = std::min({1.0, double(maxWidth) / frame->width, double(maxHeight) / frame->height});
     const int outWidth = std::max(2, int(std::lround(frame->width * scale)));
     const int outHeight = std::max(2, int(std::lround(frame->height * scale)));
